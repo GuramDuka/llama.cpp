@@ -50,9 +50,10 @@ void kv_cache_trie::insert(const std::vector<int32_t> & tokens, size_t entry_ind
         node = node->children->at(token_id).get();
     }
 
-    // Add entry index to the final node (all tokens in sequence share this prefix)
-    LOG("KV cache trie insert: adding entry_index=%zu to node at depth %zu\n", entry_index, tokens.size());
-    node->entry_indices.push_back(entry_index);
+    // Add entry index to the root node (all sequences share this prefix)
+    // This allows LCP matching by checking entries at any depth
+    LOG("KV cache trie insert: adding entry_index=%zu to root node\n", entry_index);
+    root_->entry_indices.push_back(entry_index);
 }
 
 std::vector<size_t> kv_cache_trie::search_prefix(const std::vector<int32_t> & tokens, float min_similarity) const {
