@@ -451,6 +451,17 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
         return false;
     }
 
+    // Replace io_magic with LLAMA_STATE_SEQ_MAGIC for compatibility with llama_state_seq_load_file
+    // io_magic is 0xaf143cd8, LLAMA_STATE_SEQ_MAGIC is 0x67677371
+    const uint32_t io_magic        = 0xaf143cd8;
+    const uint32_t state_seq_magic = 0x67677371;
+    if (bytes_written >= sizeof(uint32_t)) {
+        uint32_t * magic_ptr = reinterpret_cast<uint32_t *>(buffer.data());
+        if (*magic_ptr == io_magic) {
+            *magic_ptr = state_seq_magic;
+        }
+    }
+
     // Write to disk
     FILE * fp = fopen(filepath.c_str(), "wb");
     if (!fp) {
