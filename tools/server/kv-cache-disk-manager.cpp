@@ -274,7 +274,7 @@ disk_cache_entry * kv_cache_disk_manager::find_matching_entry(const std::vector<
 }
 
 // Find matching KV cache entry on disk for given token sequence
-std::string kv_cache_disk_manager::find_cache_entry(const server_tokens & tokens, float lcp_threshold) {
+std::string kv_cache_disk_manager::find_cache_entry(const llama_tokens & tokens, float lcp_threshold) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!trie_ || tokens.empty()) {
@@ -283,24 +283,18 @@ std::string kv_cache_disk_manager::find_cache_entry(const server_tokens & tokens
         return "";
     }
 
-    // Convert server_tokens to vector<int32_t> for trie matching
-    std::vector<int32_t> token_vec(tokens.size());
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        token_vec[i] = static_cast<int32_t>(tokens[i]);
-    }
-
     // Use configured threshold if not explicitly provided
     float effective_threshold = (lcp_threshold > 0.0f) ? lcp_threshold : prompt_similarity_threshold_;
 
-    LOG("KV cache search: tokens=%zu, threshold=%.3f, trie_nodes=%zu\n", token_vec.size(), effective_threshold,
+    LOG("KV cache search: tokens=%zu, threshold=%.3f, trie_nodes=%zu\n", tokens.size(), effective_threshold,
         trie_->get_stats().total_nodes);
 
     // Use Radix Tree for O(m log k) prefix matching
-    disk_cache_entry * match = find_matching_entry(token_vec, effective_threshold);
+    disk_cache_entry * match = find_matching_entry(tokens, effective_threshold);
 
     if (match) {
         metrics_.cache_hits++;
-        float actual_lcp = calculate_lcp_ratio(match->tokens, token_vec);
+        float actual_lcp = calculate_lcp_ratio(match->tokens, tokens);
         LOG("KV cache HIT: LCP=%.3f (threshold=%.3f), file='%s'\n", actual_lcp, effective_threshold,
             match->filepath.c_str());
 
@@ -359,10 +353,10 @@ float kv_cache_disk_manager::get_prompt_similarity_threshold() const {
     return prompt_similarity_threshold_;
 }
 
-bool kv_cache_disk_manager::save_to_disk(int32_t               slot_id,
-                                         llama_context *       ctx_tgt,
-                                         llama_context *       ctx_dft,
-                                         const server_tokens * tokens) {
+bool kv_cache_disk_manager::save_to_disk(int32_t              slot_id,
+                                         llama_context *      ctx_tgt,
+                                         llama_context *      ctx_dft,
+                                         const llama_tokens * tokens) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!ctx_tgt) {

@@ -202,6 +202,9 @@ struct server_slot {
     // Callback for saving KV cache to disk after generation (for --kv-cache-auto)
     std::function<void()> callback_save_kv_cache_to_disk;
 
+    // Store original task tokens for KV cache matching (captured before task completion)
+    llama_tokens kv_cache_original_tokens;
+
     // Speculative decoding stats
     int32_t              n_draft_total       = 0;  // Total draft tokens generated
     int32_t              n_draft_accepted    = 0;  // Draft tokens actually accepted
@@ -1332,10 +1335,10 @@ struct server_context_impl {
                                 slot.id, (void *) slot.ctx_tgt, slot.task ? 1 : 0, slot.prompt.tokens.size(),
                                 slot.task ? slot.task->tokens.size() : 0, slot.n_decoded);
 
-                            // Save KV cache to disk using task tokens if available (more reliable than prompt.tokens)
-                            if (slot.task && slot.task->tokens.size() > 0) {
+                            // Save KV cache to disk using original tokens captured at task start (more reliable than prompt.tokens)
+                            if (!slot.kv_cache_original_tokens.empty()) {
                                 kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
-                                                                &slot.task->tokens);
+                                                                &slot.kv_cache_original_tokens);
                             } else if (slot.prompt.tokens.size() > 0) {
                                 kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
                                                                 &slot.prompt.tokens);
@@ -1724,6 +1727,11 @@ struct server_context_impl {
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        // Store original tokens for KV cache matching (before task is cleared)
+        if (slot.task->tokens.get_tokens().size() > 0) {
+            slot.kv_cache_original_tokens = slot.task->tokens.get_tokens();
+        }
 
         slot.state = slot.task->is_child() ? SLOT_STATE_WAIT_OTHER  // wait for the parent to process prompt
                                              :

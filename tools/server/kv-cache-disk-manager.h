@@ -10,6 +10,10 @@
 #include <vector>
 
 // Forward declarations
+struct server_tokens;
+using llama_tokens = std::vector<int32_t>;
+
+// Forward declarations
 struct llama_context;
 struct server_tokens;
 
@@ -142,7 +146,7 @@ class kv_cache_disk_manager {
     // Find matching KV cache entry on disk for given token sequence
     // Returns: filepath string if match found, empty string otherwise
     // Note: Caller must restore using llama_state_seq_load_file API
-    std::string find_cache_entry(const server_tokens & tokens, float lcp_threshold);
+    std::string find_cache_entry(const llama_tokens & tokens, float lcp_threshold);
 
     // Restore KV cache state from disk file to slot context
     // filepath: path to saved state file
@@ -160,10 +164,10 @@ class kv_cache_disk_manager {
     // Save the current KV cache state to disk after successful generation
     // tokens: token sequence for LCP matching (first N tokens stored)
     // Returns true on success
-    bool save_to_disk(int32_t               slot_id,
-                      llama_context *       ctx_tgt,
-                      llama_context *       ctx_dft = nullptr,
-                      const server_tokens * tokens  = nullptr);
+    bool save_to_disk(int32_t              slot_id,
+                      llama_context *      ctx_tgt,
+                      llama_context *      ctx_dft = nullptr,
+                      const llama_tokens * tokens  = nullptr);
 
     // Get current metrics (thread-safe)
     kv_cache_metrics get_metrics() const;
