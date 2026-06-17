@@ -99,10 +99,16 @@ kv_cache_trie_node * kv_cache_trie::find_matching_node(const std::vector<int32_t
 
         auto it = node->children->find(token_id);
         if (it == node->children->end()) {
+            LOG("KV cache trie: token[%zu]=%u not found in trie (depth=%zu)\n", i, token_id, i);
             break;  // Token not found in trie
         }
 
         node = it->second.get();
+    }
+
+    if (node) {
+        LOG("KV cache trie: found matching node at depth %zu, entry_indices.size()=%zu\n", tokens.size(),
+            node->entry_indices.size());
     }
 
     return node;
