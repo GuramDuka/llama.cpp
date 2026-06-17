@@ -51,6 +51,7 @@ void kv_cache_trie::insert(const std::vector<int32_t> & tokens, size_t entry_ind
     }
 
     // Add entry index to the final node (all tokens in sequence share this prefix)
+    LOG("KV cache trie insert: adding entry_index=%zu to node at depth %zu\n", entry_index, tokens.size());
     node->entry_indices.push_back(entry_index);
 }
 
