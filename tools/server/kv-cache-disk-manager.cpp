@@ -60,9 +60,9 @@ std::vector<size_t> kv_cache_trie::search_prefix(const std::vector<int32_t> & to
     kv_cache_trie_node * node = find_matching_node(tokens);
     std::vector<size_t>  matching_entries;
 
-    if (node) {
-        // Collect all entries at this prefix node
-        for (size_t entry_idx : node->entry_indices) {
+    // Collect entries from root node (all sequences share this prefix)
+    if (root_ && !root_->entry_indices.empty()) {
+        for (size_t entry_idx : root_->entry_indices) {
             // Note: Actual similarity check happens in kv_cache_disk_manager
             // This is a fast pre-filter using trie structure
             matching_entries.push_back(entry_idx);
