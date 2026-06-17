@@ -1731,15 +1731,15 @@ struct server_context_impl {
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         // Store original tokens for KV cache matching (before task is cleared)
-        // Note: We use slot.prompt.tokens which contains the actual prompt tokens after processing
+        // Note: We use task->tokens which contains only user tokens (no system prompt)
         LOG_INF("KV cache token capture: task_tokens=%zu, slot_prompt_tokens=%zu\n",
                 slot.task->tokens.get_tokens().size(), slot.prompt.tokens.size());
-        if (slot.prompt.tokens.size() > 0) {
-            // Use prompt tokens which are guaranteed to be populated
-            slot.kv_cache_original_tokens = slot.prompt.tokens.get_tokens();
-        } else if (slot.task->tokens.get_tokens().size() > 0) {
-            // Fallback to task tokens if prompt tokens not available yet
+        if (slot.task->tokens.get_tokens().size() > 0) {
+            // Use task tokens which contain only user tokens (no system prompt)
             slot.kv_cache_original_tokens = slot.task->tokens.get_tokens();
+        } else if (slot.prompt.tokens.size() > 0) {
+            // Fallback to prompt tokens if task tokens not available yet
+            slot.kv_cache_original_tokens = slot.prompt.tokens.get_tokens();
         }
 
         slot.state = slot.task->is_child() ? SLOT_STATE_WAIT_OTHER  // wait for the parent to process prompt
