@@ -1325,9 +1325,14 @@ struct server_context_impl {
                                 return;
                             }
 
-                            // Save KV cache to disk
-                            SLT_DBG(slot, "saving KV cache to disk: slot=%d, tokens=%d\n", slot.id, slot.n_decoded);
+                            // Debug: log callback invocation and token state
+                            LOG_INF(
+                                "KV cache callback invoked: slot=%d, ctx_tgt=%p, task_valid=%d, prompt_tokens=%zu, "
+                                "n_decoded=%d\n",
+                                slot.id, (void *) slot.ctx_tgt, slot.task ? 1 : 0, slot.prompt.tokens.size(),
+                                slot.n_decoded);
 
+                            // Save KV cache to disk
                             if (slot.prompt.tokens.size() > 0) {
                                 kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
                                                                 &slot.prompt.tokens);

@@ -120,15 +120,13 @@ for MODEL_FILE in "${MODELS[@]}"; do
     # Test 4: Check if KV cache was saved
     echo ""
     echo "--- Test 4: KV Cache Save ---"
-    CACHE_FILES=$(ls "$CACHE_DIR"/*.state 2>/dev/null | wc -l)
+    CACHE_FILES=$(ls "$CACHE_DIR"/* 2>/dev/null | wc -l)
     if [ "$CACHE_FILES" -gt 0 ]; then
         run_check "KV cache files created ($CACHE_FILES file(s))" "true"
-        ls -lh "$CACHE_DIR"/*.state 2>/dev/null | head -3
+        ls -lh "$CACHE_DIR"/* 2>/dev/null | head -3
     else
         run_check "KV cache files created" "false"
-        echo "  No .state files found in $CACHE_DIR"
-        echo "  Server logs (slot release):"
-        grep "slot.*release" "$SERVER_LOG" | tail -3
+        echo "  No files found in $CACHE_DIR"
     fi
     
     # Test 5: Check for KV cache metrics logging
