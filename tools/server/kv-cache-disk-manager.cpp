@@ -227,7 +227,13 @@ disk_cache_entry * kv_cache_disk_manager::find_matching_entry(const std::vector<
     }
 
     // Use Radix Tree for fast prefix matching
+    auto trie_stats = trie_->get_stats();
+    LOG("KV cache trie search: tokens=%zu, trie_nodes=%zu, max_depth=%zu\n", tokens.size(), trie_stats.total_nodes,
+        trie_stats.max_depth);
+
     std::vector<size_t> candidate_indices = trie_->search_prefix(tokens, 0.0f);  // Pre-filter by trie structure
+
+    LOG("KV cache trie search: found %zu candidates\n", candidate_indices.size());
 
     if (candidate_indices.empty()) {
         return nullptr;
