@@ -59,7 +59,7 @@ for MODEL_FILE in "${MODELS[@]}"; do
     mkdir -p "$CACHE_DIR"
     rm -f "$SERVER_LOG"
     
-    # Start server
+    # Start server (without keep-alive - it stops when idle)
     echo ""
     echo "Starting server..."
     "$BUILD_DIR/bin/llama-server" \
@@ -97,21 +97,23 @@ for MODEL_FILE in "${MODELS[@]}"; do
     echo "--- Test 2: Cache Directory ---"
     [ -d "$CACHE_DIR" ] && run_check "Cache directory exists" "true" || run_check "Cache directory exists" "false"
     
-    # Test 3: Make a test request
+    # Test 3: Make first test request (will save KV cache)
     echo ""
-    echo "--- Test 3: Test Request ---"
-    echo "Making test request..."
-    RESPONSE=$(curl -s --max-time 60 http://localhost:$PORT/v1/chat/completions \
+    echo "--- Test 3: First Request (Save KV Cache) ---"
+    echo "Making first test request..."
+    RESPONSE1=$(curl -s --max-time 60 http://localhost:$PORT/v1/chat/completions \
         -H "Content-Type: application/json" \
         -d '{
             "model": "test",
             "messages": [{"role": "user", "content": "Tell me a short joke"}]
         }' 2>/dev/null || echo "")
     
-    if [ -n "$RESPONSE" ]; then
-        run_check "Response received from server" "true"
+    if [ -n "$RESPONSE1" ]; then
+        run_check "First request response received" "true"
+        TOKEN_COUNT=$(echo "$RESPONSE1" | grep -o '"completion_tokens":[0-9]*' | grep -o '[0-9]*$' || echo "unknown")
+        echo "  Response tokens: $TOKEN_COUNT"
     else
-        run_check "Response received from server" "false"
+        run_check "First request response received" "false"
     fi
     
     # Wait for request to complete and callback to execute
@@ -124,6 +126,9 @@ for MODEL_FILE in "${MODELS[@]}"; do
     if [ "$CACHE_FILES" -gt 0 ]; then
         run_check "KV cache files created ($CACHE_FILES file(s))" "true"
         ls -lh "$CACHE_DIR"/* 2>/dev/null | head -3
+        
+        CACHE_FILE=$(ls "$CACHE_DIR"/* 2>/dev/null | head -1)
+        echo "  Cache file: $CACHE_FILE"
     else
         run_check "KV cache files created" "false"
         echo "  No files found in $CACHE_DIR"
@@ -133,6 +138,35 @@ for MODEL_FILE in "${MODELS[@]}"; do
     echo ""
     echo "--- Test 5: Metrics Logging ---"
     grep -q "KV cache stats" "$SERVER_LOG" && run_check "KV cache metrics logged" "true" || run_check "KV cache metrics logged (may take 5 min)" "false"
+    
+    METRICS=$(grep "KV cache stats" "$SERVER_LOG" | tail -1)
+    if [ -n "$METRICS" ]; then
+        echo "  Metrics: $METRICS"
+    fi
+    
+    # Test 6: Check callback invocation logs
+    echo ""
+    echo "--- Test 6: Callback Invocation ---"
+    CALLBACK_INVOKED=$(grep -c "KV cache callback invoked" "$SERVER_LOG" 2>/dev/null || echo "0")
+    if [ "$CALLBACK_INVOKED" -gt 0 ]; then
+        run_check "Callback was invoked ($CALLBACK_INVOKED time(s))" "true"
+        echo "  Last callback log: $(grep 'KV cache callback invoked' $SERVER_LOG | tail -1)"
+    else
+        run_check "Callback was invoked" "false"
+        echo "  Callback may not have been called or logged at this verbosity level"
+    fi
+    
+    # Test 7: Check KV cache save logs
+    echo ""
+    echo "--- Test 7: KV Cache Save Logs ---"
+    SAVE_LOGS=$(grep -c "KV cache saved" "$SERVER_LOG" 2>/dev/null || echo "0")
+    if [ "$SAVE_LOGS" -gt 0 ]; then
+        run_check "KV cache save confirmed in logs ($SAVE_LOGS time(s))" "true"
+        echo "  Save log: $(grep 'KV cache saved' $SERVER_LOG | tail -1)"
+    else
+        run_check "KV cache save confirmed in logs" "false"
+        echo "  No save confirmation found in logs"
+    fi
     
     # Stop server
     cleanup_server "$SERVER_PID"
