@@ -1328,12 +1328,15 @@ struct server_context_impl {
                             // Debug: log callback invocation and token state
                             LOG_INF(
                                 "KV cache callback invoked: slot=%d, ctx_tgt=%p, task_valid=%d, prompt_tokens=%zu, "
-                                "n_decoded=%d\n",
+                                "task_tokens=%zu, n_decoded=%d\n",
                                 slot.id, (void *) slot.ctx_tgt, slot.task ? 1 : 0, slot.prompt.tokens.size(),
-                                slot.n_decoded);
+                                slot.task ? slot.task->tokens.size() : 0, slot.n_decoded);
 
-                            // Save KV cache to disk
-                            if (slot.prompt.tokens.size() > 0) {
+                            // Save KV cache to disk using task tokens if available (more reliable than prompt.tokens)
+                            if (slot.task && slot.task->tokens.size() > 0) {
+                                kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
+                                                                &slot.task->tokens);
+                            } else if (slot.prompt.tokens.size() > 0) {
                                 kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
                                                                 &slot.prompt.tokens);
                             } else {
