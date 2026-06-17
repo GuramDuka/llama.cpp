@@ -164,10 +164,17 @@ class kv_cache_disk_manager {
     // Save the current KV cache state to disk after successful generation
     // tokens: token sequence for LCP matching (first N tokens stored)
     // Returns true on success
-    bool save_to_disk(int32_t              slot_id,
-                      llama_context *      ctx_tgt,
-                      llama_context *      ctx_dft = nullptr,
-                      const llama_tokens * tokens  = nullptr);
+    bool save_to_disk(int32_t         slot_id,
+                      llama_context * ctx_tgt,
+                      llama_context * ctx_dft     = nullptr,
+                      const int32_t * tokens      = nullptr,
+                      size_t          token_count = 0);
+
+    // Overload for convenience (backward compatible)
+    bool save_to_disk(int32_t         slot_id,
+                      llama_context * ctx_tgt,
+                      llama_context * ctx_dft = nullptr,
+                      const int32_t * tokens  = nullptr);
 
     // Get current metrics (thread-safe)
     kv_cache_metrics get_metrics() const;

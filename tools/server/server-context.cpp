@@ -1338,12 +1338,14 @@ struct server_context_impl {
                             // Save KV cache to disk using original tokens captured at task start (more reliable than prompt.tokens)
                             if (!slot.kv_cache_original_tokens.empty()) {
                                 kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
-                                                                &slot.kv_cache_original_tokens);
+                                                                slot.kv_cache_original_tokens.data(),
+                                                                slot.kv_cache_original_tokens.size());
                             } else if (slot.prompt.tokens.size() > 0) {
                                 kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
-                                                                &slot.prompt.tokens);
+                                                                slot.prompt.tokens.get_tokens().data(),
+                                                                slot.prompt.tokens.get_tokens().size());
                             } else {
-                                kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft, nullptr);
+                                kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft, nullptr, 0);
                             }
                         };
                     }
@@ -1462,7 +1464,7 @@ struct server_context_impl {
                 }
 
                 // Try to restore from disk with sorted candidate selection
-                std::string cache_file = kv_cache_disk_mgr->find_cache_entry(task.tokens, lcp_threshold);
+                std::string cache_file = kv_cache_disk_mgr->find_cache_entry(task.tokens.get_tokens(), lcp_threshold);
 
                 if (!cache_file.empty()) {
                     // Found matching cache entry - try to restore KV state

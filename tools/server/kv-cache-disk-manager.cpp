@@ -353,10 +353,11 @@ float kv_cache_disk_manager::get_prompt_similarity_threshold() const {
     return prompt_similarity_threshold_;
 }
 
-bool kv_cache_disk_manager::save_to_disk(int32_t              slot_id,
-                                         llama_context *      ctx_tgt,
-                                         llama_context *      ctx_dft,
-                                         const llama_tokens * tokens) {
+bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
+                                         llama_context * ctx_tgt,
+                                         llama_context * ctx_dft,
+                                         const int32_t * tokens,
+                                         size_t          token_count) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!ctx_tgt) {
@@ -424,12 +425,11 @@ bool kv_cache_disk_manager::save_to_disk(int32_t              slot_id,
     entry.seq_id           = slot_id;
 
     // Store token sequence for LCP matching (limit to MAX_TOKENS)
-    if (tokens && !tokens->empty()) {
-        size_t tokens_to_store = std::min(tokens->size(), static_cast<size_t>(KV_CACHE_MAX_TOKENS));
-        // Convert server_tokens to vector<int32_t>
+    if (tokens && token_count > 0) {
+        size_t tokens_to_store = std::min(token_count, static_cast<size_t>(KV_CACHE_MAX_TOKENS));
         entry.tokens.reserve(tokens_to_store);
         for (size_t i = 0; i < tokens_to_store; ++i) {
-            entry.tokens.push_back(static_cast<int32_t>((*tokens)[i]));
+            entry.tokens.push_back(tokens[i]);
         }
     }
 
@@ -460,6 +460,15 @@ bool kv_cache_disk_manager::save_to_disk(int32_t              slot_id,
     LOG("KV cache saved: slot=%d, size=%zu bytes, file='%s'\n", slot_id, written, filepath.c_str());
 
     return true;
+}
+
+// Overload for convenience (backward compatible - assumes token_count from tokens pointer)
+bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
+                                         llama_context * ctx_tgt,
+                                         llama_context * ctx_dft,
+                                         const int32_t * tokens) {
+    // This overload doesn't know the token count, so it won't store tokens for matching
+    return save_to_disk(slot_id, ctx_tgt, ctx_dft, tokens, 0);
 }
 
 void kv_cache_disk_manager::evict_expired_entries() {
