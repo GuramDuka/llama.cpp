@@ -2,6 +2,8 @@
 
 #include "server-common.h"
 
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
@@ -352,6 +354,12 @@ bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int3
     if (!std::filesystem::exists(filepath)) {
         LOG_WRN("KV cache restore: file '%s' does not exist\n", filepath.c_str());
         return false;
+    }
+
+    // Get file size for logging
+    struct stat st;
+    if (stat(filepath.c_str(), &st) == 0) {
+        LOG("KV cache restore: file '%s' size=%ld bytes\n", filepath.c_str(), st.st_size);
     }
 
     // Load tokens and KV cache into context
