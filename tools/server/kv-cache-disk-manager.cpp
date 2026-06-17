@@ -93,7 +93,8 @@ kv_cache_trie::stats kv_cache_trie::get_stats() const {
 }
 
 kv_cache_trie_node * kv_cache_trie::find_matching_node(const std::vector<int32_t> & tokens) const {
-    kv_cache_trie_node * node = root_.get();
+    kv_cache_trie_node * node               = root_.get();
+    kv_cache_trie_node * last_matching_node = nullptr;
 
     for (size_t i = 0; i < tokens.size() && node; ++i) {
         uint32_t token_id = static_cast<uint32_t>(tokens[i]);
@@ -104,15 +105,26 @@ kv_cache_trie_node * kv_cache_trie::find_matching_node(const std::vector<int32_t
             break;  // Token not found in trie
         }
 
-        node = it->second.get();
+        last_matching_node = node;  // Track last matching node
+        node               = it->second.get();
     }
 
-    if (node) {
-        LOG("KV cache trie: found matching node at depth %zu, entry_indices.size()=%zu\n", tokens.size(),
-            node->entry_indices.size());
+    // Return the deepest node with entry_indices (not necessarily the full match)
+    // This allows LCP matching for similar but not identical sequences
+    kv_cache_trie_node * result = node;
+    if (!result || result->entry_indices.empty()) {
+        // Try last matching node if current one has no entries
+        if (last_matching_node && !last_matching_node->entry_indices.empty()) {
+            result = last_matching_node;
+        }
     }
 
-    return node;
+    if (result) {
+        LOG("KV cache trie: found matching node at depth %zu, entry_indices.size()=%zu\n",
+            result == last_matching_node ? tokens.size() - 1 : tokens.size(), result->entry_indices.size());
+    }
+
+    return result;
 }
 
 size_t kv_cache_trie::count_nodes(kv_cache_trie_node * node) const {
