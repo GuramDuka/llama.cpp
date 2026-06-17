@@ -169,12 +169,12 @@ class kv_cache_disk_manager {
     // Cleanup all cache files (for manual purge)
     void purge_all_cache_files();
 
+    // Calculate LCP ratio between two token sequences (public for use in callbacks)
+    float calculate_lcp_ratio(const std::vector<int32_t> & tokens_a, const std::vector<int32_t> & tokens_b) const;
+
   private:
     // Generate unique filename for a slot's KV cache
     std::string generate_cache_filename(int32_t seq_id, int64_t timestamp_us);
-
-    // Calculate Longest Common Prefix ratio between two token sequences
-    float calculate_lcp_ratio(const std::vector<int32_t> & tokens_a, const std::vector<int32_t> & tokens_b) const;
 
     // Find matching cache entry by prompt similarity using Radix Tree
     disk_cache_entry * find_matching_entry(const std::vector<int32_t> & tokens, float threshold);

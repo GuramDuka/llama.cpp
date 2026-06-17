@@ -22,9 +22,9 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <utility>
-
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
@@ -198,6 +198,9 @@ struct server_slot {
     double t_token_generation  = 0.0;  // ms
 
     std::function<void(int /* id_slot */)> callback_on_release;
+
+    // Callback for saving KV cache to disk after generation (for --kv-cache-auto)
+    std::function<void()> callback_save_kv_cache_to_disk;
 
     // Speculative decoding stats
     int32_t              n_draft_total       = 0;  // Total draft tokens generated
@@ -390,20 +393,18 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
-            // Save KV cache to disk if auto-save is enabled and generation completed normally
-            // This must happen BEFORE reset() clears the slot state
-            if (task && task->need_sampling() && n_decoded > 0) {
-                // Access kv_cache_disk_mgr from server_context_impl - need to pass it via callback or member
-                // For now, we'll save after reset through a deferred mechanism
-                // TODO: This should be integrated with the slot's parent context
-            }
-
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
                 prompt_clear(false);
             }
 
             reset();
+
+            // Save KV cache to disk if auto-save is enabled and generation completed normally
+            // This happens AFTER reset() because we need ctx_tgt/ctx_dft which are preserved
+            if (callback_save_kv_cache_to_disk) {
+                callback_save_kv_cache_to_disk();
+            }
 
             callback_on_release(id);
         }
@@ -1308,6 +1309,39 @@ struct server_context_impl {
 
                     // Reconcile orphaned files on startup
                     kv_cache_disk_mgr->reconcile_orphaned_files();
+
+                    // Install KV cache save callback for all slots
+                    // This captures this (server_context_impl) to access kv_cache_disk_mgr, ctx_tgt, ctx_dft
+                    for (int i = 0; i < params_base.n_parallel; i++) {
+                        server_slot & slot                  = slots[i];
+                        slot.callback_save_kv_cache_to_disk = [this, &slot]() {
+                            // Only save if generation was successful and not cancelled
+                            if (!kv_cache_disk_mgr || !ctx_tgt || slot.task->params.stream) {
+                                return;
+                            }
+
+                            // Skip saving if prompt already matched cache (avoid redundant writes)
+                            if (slot.prompt.tokens.size() > 0) {
+                                float sim = kv_cache_disk_mgr->calculate_lcp_ratio(
+                                    slot.prompt.tokens, slot.task ? std::vector<int32_t>(slot.task->tokens.begin(),
+                                                                                         slot.task->tokens.end()) :
+                                                                    std::vector<int32_t>());
+                                if (sim >= params_base.slot_prompt_similarity) {
+                                    SLT_DBG(slot, "skipping save: prompt matched existing cache entry\n");
+                                    return;
+                                }
+                            }
+
+                            // Save KV cache to disk
+                            SLT_DBG(slot, "saving KV cache to disk: slot=%d, tokens=%d\n", slot.id, slot.n_decoded);
+
+                            if (slot.prompt.tokens.size() > 0) {
+                                kv_cache_disk_mgr->save_to_disk(slot.id, ctx_tgt, ctx_dft, &slot.prompt.tokens);
+                            } else {
+                                kv_cache_disk_mgr->save_to_disk(slot.id, ctx_tgt, ctx_dft, nullptr);
+                            }
+                        };
+                    }
 
                     SRV_INF("KV cache auto enabled: dir='%s', max=%.1f GB, ttl=%" PRId64 "s, sim_threshold=%.3f\n",
                             cache_dir.c_str(), params_base.max_cache_size_gb, params_base.cache_ttl_seconds,
