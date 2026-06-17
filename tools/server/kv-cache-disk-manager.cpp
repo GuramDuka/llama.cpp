@@ -454,6 +454,7 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
 
     // Insert into Radix Tree for efficient prefix matching
     if (trie_ && !entry.tokens.empty()) {
+        LOG("KV cache trie insert: tokens=%zu, entry_index=%zu\n", entry.tokens.size(), lru_ring_.size() - 1);
         trie_->insert(entry.tokens, lru_ring_.size() - 1);
     }
 
