@@ -115,6 +115,8 @@ kv_cache_trie_node * kv_cache_trie::find_matching_node(const std::vector<int32_t
     if (!result || result->entry_indices.empty()) {
         // Try last matching node if current one has no entries
         if (last_matching_node && !last_matching_node->entry_indices.empty()) {
+            LOG("KV cache trie: fallback to last_matching_node with %zu entries\n",
+                last_matching_node->entry_indices.size());
             result = last_matching_node;
         }
     }
@@ -122,6 +124,8 @@ kv_cache_trie_node * kv_cache_trie::find_matching_node(const std::vector<int32_t
     if (result) {
         LOG("KV cache trie: found matching node at depth %zu, entry_indices.size()=%zu\n",
             result == last_matching_node ? tokens.size() - 1 : tokens.size(), result->entry_indices.size());
+    } else {
+        LOG("KV cache trie: no matching node with entries found\n");
     }
 
     return result;
