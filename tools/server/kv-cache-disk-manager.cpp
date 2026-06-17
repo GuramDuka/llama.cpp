@@ -279,6 +279,7 @@ std::string kv_cache_disk_manager::find_cache_entry(const server_tokens & tokens
 
     if (!trie_ || tokens.empty()) {
         metrics_.cache_misses++;
+        LOG("KV cache MISS: trie not initialized or tokens empty\n");
         return "";
     }
 
@@ -290,6 +291,9 @@ std::string kv_cache_disk_manager::find_cache_entry(const server_tokens & tokens
 
     // Use configured threshold if not explicitly provided
     float effective_threshold = (lcp_threshold > 0.0f) ? lcp_threshold : prompt_similarity_threshold_;
+
+    LOG("KV cache search: tokens=%zu, threshold=%.3f, trie_nodes=%zu\n", token_vec.size(), effective_threshold,
+        trie_->get_stats().total_nodes);
 
     // Use Radix Tree for O(m log k) prefix matching
     disk_cache_entry * match = find_matching_entry(token_vec, effective_threshold);
@@ -304,6 +308,7 @@ std::string kv_cache_disk_manager::find_cache_entry(const server_tokens & tokens
     }
 
     metrics_.cache_misses++;
+    LOG("KV cache MISS: no matching entry found\n");
     return "";
 }
 
