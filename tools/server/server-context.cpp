@@ -1466,8 +1466,11 @@ struct server_context_impl {
                 // Try to restore from disk with sorted candidate selection
                 std::string cache_file = kv_cache_disk_mgr->find_cache_entry(task.tokens.get_tokens(), lcp_threshold);
 
+                LOG("KV cache auto: checking slot %d, cache_file='%s'\n", slot.id, cache_file.c_str());
+
                 if (!cache_file.empty()) {
                     // Found matching cache entry - try to restore KV state
+                    LOG("KV cache auto: attempting restore for slot %d from '%s'\n", slot.id, cache_file.c_str());
                     if (kv_cache_disk_mgr->restore_from_disk(cache_file, slot.id, ctx_tgt)) {
                         ret = &slot;
                         SLT_INF(*ret, "restored slot from disk cache (LCP hit)\n");
