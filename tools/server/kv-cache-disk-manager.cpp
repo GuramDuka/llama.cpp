@@ -354,15 +354,10 @@ bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int3
         return false;
     }
 
-    // Load state from disk using llama_state_seq_load_file API
-    size_t state_size = llama_state_seq_get_size(ctx_tgt, slot_id);
-    if (state_size == 0) {
-        LOG_WRN("KV cache restore: no state allocated for slot %d\n", slot_id);
-        return false;
-    }
-
     // Load tokens and KV cache into context
-    size_t bytes_loaded = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot_id, nullptr, 0, nullptr);
+    // Note: llama_state_seq_load_file internally handles state allocation via state_read
+    // Using -1 as seq_id to load all streams (not just specific slot)
+    size_t bytes_loaded = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), -1, nullptr, 0, nullptr);
 
     if (bytes_loaded == 0) {
         LOG_WRN("KV cache restore: failed to load state from '%s'\n", filepath.c_str());
