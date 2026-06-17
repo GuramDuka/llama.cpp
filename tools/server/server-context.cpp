@@ -1311,39 +1311,28 @@ struct server_context_impl {
                     kv_cache_disk_mgr->reconcile_orphaned_files();
 
                     // Install KV cache save callback for all slots
-                    // This captures this (server_context_impl) to access kv_cache_disk_mgr, ctx_tgt, ctx_dft
+                    // Note: slot.ctx_tgt and slot.ctx_dft are set in load_model loop before this
                     for (int i = 0; i < params_base.n_parallel; i++) {
                         server_slot & slot                  = slots[i];
                         slot.callback_save_kv_cache_to_disk = [this, &slot]() {
                             // Only save if generation was successful and not cancelled
-                            if (!kv_cache_disk_mgr || !ctx_tgt || slot.task->params.stream) {
+                            if (!kv_cache_disk_mgr || !slot.ctx_tgt || slot.task->params.stream) {
                                 return;
-                            }
-
-                            // Skip saving if prompt already matched cache (avoid redundant writes)
-                            if (slot.prompt.tokens.size() > 0) {
-                                float sim = kv_cache_disk_mgr->calculate_lcp_ratio(
-                                    slot.prompt.tokens, slot.task ? std::vector<int32_t>(slot.task->tokens.begin(),
-                                                                                         slot.task->tokens.end()) :
-                                                                    std::vector<int32_t>());
-                                if (sim >= params_base.slot_prompt_similarity) {
-                                    SLT_DBG(slot, "skipping save: prompt matched existing cache entry\n");
-                                    return;
-                                }
                             }
 
                             // Save KV cache to disk
                             SLT_DBG(slot, "saving KV cache to disk: slot=%d, tokens=%d\n", slot.id, slot.n_decoded);
 
                             if (slot.prompt.tokens.size() > 0) {
-                                kv_cache_disk_mgr->save_to_disk(slot.id, ctx_tgt, ctx_dft, &slot.prompt.tokens);
+                                kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
+                                                                &slot.prompt.tokens);
                             } else {
-                                kv_cache_disk_mgr->save_to_disk(slot.id, ctx_tgt, ctx_dft, nullptr);
+                                kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft, nullptr);
                             }
                         };
                     }
 
-                    SRV_INF("KV cache auto enabled: dir='%s', max=%.1f GB, ttl=%" PRId64 "s, sim_threshold=%.3f\n",
+                    LOG_INF("KV cache auto enabled: dir='%s', max=%.1f GB, ttl=%ld s, sim_threshold=%.3f\n",
                             cache_dir.c_str(), params_base.max_cache_size_gb, params_base.cache_ttl_seconds,
                             params_base.slot_prompt_similarity);
                 }
@@ -3775,12 +3764,12 @@ struct server_context_impl {
             if ((ggml_time_us() - last_metrics_log) > 300 * 1000000LL) {
                 auto metrics = kv_cache_disk_mgr->get_metrics();
 
-                SRV_INF("KV cache stats: hits=%llu misses=%llu saves=%llu evictions_ttl=%llu evictions_lru=%llu\n",
-                        (unsigned long long) metrics.cache_hits.load(),
-                        (unsigned long long) metrics.cache_misses.load(),
-                        (unsigned long long) metrics.saves_completed.load(),
-                        (unsigned long long) metrics.evictions_ttl.load(),
-                        (unsigned long long) metrics.evictions_lru.load());
+                SRV_INF(
+                    "KV cache stats: hits=%llu misses=%llu saves=%llu restores=%llu evictions_ttl=%llu "
+                    "evictions_lru=%llu\n",
+                    (unsigned long long) metrics.cache_hits, (unsigned long long) metrics.cache_misses,
+                    (unsigned long long) metrics.saves_completed, (unsigned long long) metrics.restores_completed,
+                    (unsigned long long) metrics.evictions_ttl, (unsigned long long) metrics.evictions_lru);
 
                 last_metrics_log = ggml_time_us();
             }

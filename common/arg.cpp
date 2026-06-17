@@ -1321,16 +1321,29 @@ common_params_context common_params_parser_init(common_params & params,
                        [](common_params & params, bool value) { params.kv_cache_auto = value; })
                 .set_env("LLAMA_ARG_KV_CACHE_AUTO")
                 .set_examples({ LLAMA_EXAMPLE_SERVER }));
-    add_opt(common_arg({ "--max-cache-size" }, "N",
-                       string_format("maximum total KV cache size per backend in GB (default: %.1f)",
-                                     params.max_cache_size_gb),
-                       [](common_params & params, float value) { params.max_cache_size_gb = value; })
-                .set_env("LLAMA_ARG_MAX_CACHE_SIZE")
-                .set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(
+        common_arg(
+            { "--max-cache-size" }, "N",
+            string_format("maximum total KV cache size per backend in GB (default: %.1f)", params.max_cache_size_gb),
+            [](common_params & params, const std::string & value) {
+                try {
+                    params.max_cache_size_gb = std::stof(value);
+                } catch (const std::exception & e) {
+                    throw std::invalid_argument(std::string("invalid value for --max-cache-size: ") + e.what());
+                }
+            })
+            .set_env("LLAMA_ARG_MAX_CACHE_SIZE")
+            .set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg({ "--cache-ttl" }, "N",
                        string_format("delete cache files older than N seconds (default: %" PRId64 ", 0 = disabled)",
                                      params.cache_ttl_seconds),
-                       [](common_params & params, int64_t value) { params.cache_ttl_seconds = value; })
+                       [](common_params & params, const std::string & value) {
+                           try {
+                               params.cache_ttl_seconds = std::stoll(value);
+                           } catch (const std::exception & e) {
+                               throw std::invalid_argument(std::string("invalid value for --cache-ttl: ") + e.what());
+                           }
+                       })
                 .set_env("LLAMA_ARG_CACHE_TTL")
                 .set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg({ "--kv-cache-dir" }, "PATH",

@@ -1,7 +1,10 @@
 #include "kv-cache-disk-manager.h"
 
+#include "server-common.h"
+
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
@@ -20,16 +23,8 @@ extern "C" {
 using namespace std::chrono_literals;
 
 // ============================================================================
-// kv_cache_trie_node Implementation
+// kv_cache_trie Implementation
 // ============================================================================
-
-kv_cache_trie_node::kv_cache_trie_node() :
-    token_id(0),
-    children(std::make_unique<std::unordered_map<uint32_t, std::unique_ptr<kv_cache_trie_node>>>()) {}
-
-bool kv_cache_trie_node::is_leaf() const {
-    return children->empty();
-}
 
 // ============================================================================
 // kv_cache_trie Implementation
@@ -173,8 +168,8 @@ bool kv_cache_disk_manager::initialize(const std::string & cache_dir, float max_
     }
     ttl_seconds_ = ttl_seconds;
 
-    LOG_INF("KV cache disk manager initialized: dir='%s', max_size=%.1f GB, ttl=%" PRId64 "s\n", cache_dir.c_str(),
-            max_size_gb, ttl_seconds);
+    fprintf(stderr, "KV cache disk manager initialized: dir='%s', max_size=%.1f GB, ttl=%ld s\n", cache_dir.c_str(),
+            max_size_gb, (long) ttl_seconds);
 
     return true;
 }
@@ -186,6 +181,27 @@ std::string kv_cache_disk_manager::generate_cache_filename(int32_t seq_id, int64
 }
 
 float kv_cache_disk_manager::calculate_lcp_ratio(const std::vector<int32_t> & tokens_a,
+                                                 const std::vector<int32_t> & tokens_b) const {
+    if (tokens_a.empty() || tokens_b.empty()) {
+        return 0.0f;
+    }
+
+    size_t min_len       = std::min(tokens_a.size(), tokens_b.size());
+    size_t common_prefix = 0;
+
+    for (size_t i = 0; i < min_len; ++i) {
+        if (tokens_a[i] == tokens_b[i]) {
+            common_prefix++;
+        } else {
+            break;
+        }
+    }
+
+    return static_cast<float>(common_prefix) / static_cast<float>(tokens_b.size());
+}
+
+// Overload for server_tokens
+float kv_cache_disk_manager::calculate_lcp_ratio(const server_tokens &        tokens_a,
                                                  const std::vector<int32_t> & tokens_b) const {
     if (tokens_a.empty() || tokens_b.empty()) {
         return 0.0f;
@@ -258,7 +274,7 @@ disk_cache_entry * kv_cache_disk_manager::find_matching_entry(const std::vector<
 }
 
 // Find matching KV cache entry on disk for given token sequence
-std::string kv_cache_disk_manager::find_cache_entry(const std::vector<int32_t> & tokens, float lcp_threshold) {
+std::string kv_cache_disk_manager::find_cache_entry(const server_tokens & tokens, float lcp_threshold) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!trie_ || tokens.empty()) {
@@ -266,17 +282,23 @@ std::string kv_cache_disk_manager::find_cache_entry(const std::vector<int32_t> &
         return "";
     }
 
+    // Convert server_tokens to vector<int32_t> for trie matching
+    std::vector<int32_t> token_vec(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        token_vec[i] = static_cast<int32_t>(tokens[i]);
+    }
+
     // Use configured threshold if not explicitly provided
     float effective_threshold = (lcp_threshold > 0.0f) ? lcp_threshold : prompt_similarity_threshold_;
 
     // Use Radix Tree for O(m log k) prefix matching
-    disk_cache_entry * match = find_matching_entry(tokens, effective_threshold);
+    disk_cache_entry * match = find_matching_entry(token_vec, effective_threshold);
 
     if (match) {
         metrics_.cache_hits++;
-        float actual_lcp = calculate_lcp_ratio(match->tokens, tokens);
-        LOG_DBG(4, "KV cache HIT: LCP=%.3f (threshold=%.3f), file='%s'\n", actual_lcp, effective_threshold,
-                match->filepath.c_str());
+        float actual_lcp = calculate_lcp_ratio(match->tokens, token_vec);
+        LOG("KV cache HIT: LCP=%.3f (threshold=%.3f), file='%s'\n", actual_lcp, effective_threshold,
+            match->filepath.c_str());
 
         return match->filepath;
     }
@@ -313,7 +335,7 @@ bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int3
         return false;
     }
 
-    LOG_INF("KV cache restored: slot=%d, file='%s', bytes=%zu\n", slot_id, filepath.c_str(), bytes_loaded);
+    LOG("KV cache restored: slot=%d, file='%s', bytes=%zu\n", slot_id, filepath.c_str(), bytes_loaded);
 
     // Update metrics
     metrics_.restores_completed++;
@@ -325,17 +347,17 @@ bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int3
 void kv_cache_disk_manager::set_prompt_similarity_threshold(float threshold) {
     std::lock_guard<std::mutex> lock(mutex_);
     prompt_similarity_threshold_ = threshold;
-    LOG_INF("KV cache prompt similarity threshold set to %.3f\n", threshold);
+    LOG("KV cache prompt similarity threshold set to %.3f\n", threshold);
 }
 
 float kv_cache_disk_manager::get_prompt_similarity_threshold() const {
     return prompt_similarity_threshold_;
 }
 
-bool kv_cache_disk_manager::save_to_disk(int32_t                      slot_id,
-                                         llama_context *              ctx_tgt,
-                                         llama_context *              ctx_dft,
-                                         const std::vector<int32_t> * tokens) {
+bool kv_cache_disk_manager::save_to_disk(int32_t               slot_id,
+                                         llama_context *       ctx_tgt,
+                                         llama_context *       ctx_dft,
+                                         const server_tokens * tokens) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!ctx_tgt) {
@@ -405,7 +427,11 @@ bool kv_cache_disk_manager::save_to_disk(int32_t                      slot_id,
     // Store token sequence for LCP matching (limit to MAX_TOKENS)
     if (tokens && !tokens->empty()) {
         size_t tokens_to_store = std::min(tokens->size(), static_cast<size_t>(KV_CACHE_MAX_TOKENS));
-        entry.tokens.assign(tokens->begin(), tokens->begin() + tokens_to_store);
+        // Convert server_tokens to vector<int32_t>
+        entry.tokens.reserve(tokens_to_store);
+        for (size_t i = 0; i < tokens_to_store; ++i) {
+            entry.tokens.push_back(static_cast<int32_t>((*tokens)[i]));
+        }
     }
 
     // Add to LRU ring
@@ -428,11 +454,11 @@ bool kv_cache_disk_manager::save_to_disk(int32_t                      slot_id,
     save_counter++;
     if (save_counter % 10 == 0) {
         auto trie_stats = trie_->get_stats();
-        LOG_DBG(4, "KV cache trie stats: nodes=%zu, max_depth=%zu, branches=%zu\n", trie_stats.total_nodes,
-                trie_stats.max_depth, trie_stats.root_branches);
+        LOG("KV cache trie stats: nodes=%zu, max_depth=%zu, branches=%zu\n", trie_stats.total_nodes,
+            trie_stats.max_depth, trie_stats.root_branches);
     }
 
-    LOG_DBG(4, "KV cache saved: slot=%d, size=%zu bytes, file='%s'\n", slot_id, written, filepath.c_str());
+    LOG("KV cache saved: slot=%d, size=%zu bytes, file='%s'\n", slot_id, written, filepath.c_str());
 
     return true;
 }
@@ -542,7 +568,7 @@ void kv_cache_disk_manager::reconcile_orphaned_files() {
 
             // Check if file is in our index
             if (filepath_index_.find(filepath) == filepath_index_.end()) {
-                LOG_INF("KV cache reconciliation: removing orphaned file '%s'\n", filepath.c_str());
+                LOG("KV cache reconciliation: removing orphaned file '%s'\n", filepath.c_str());
 
                 size_t file_size = 0;
                 try {
@@ -567,7 +593,7 @@ void kv_cache_disk_manager::purge_all_cache_files() {
         return;
     }
 
-    LOG_INF("KV cache purge: removing all files from '%s'\n", cache_dir_.c_str());
+    LOG("KV cache purge: removing all files from '%s'\n", cache_dir_.c_str());
 
     size_t total_freed = 0;
 
@@ -596,5 +622,5 @@ void kv_cache_disk_manager::purge_all_cache_files() {
         }
     }
 
-    LOG_INF("KV cache purge complete: freed %zu bytes, removed %zu files\n", total_freed, lru_ring_.size());
+    LOG("KV cache purge complete: freed %zu bytes, removed %zu files\n", total_freed, lru_ring_.size());
 }

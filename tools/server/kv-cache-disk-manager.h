@@ -18,20 +18,24 @@ struct server_tokens;
 
 // Metrics for cache operations tracking
 struct kv_cache_metrics {
-    std::atomic<uint64_t> cache_hits      = 0;
-    std::atomic<uint64_t> cache_misses    = 0;
-    std::atomic<uint64_t> saves_completed = 0;
-    std::atomic<uint64_t> saves_skipped   = 0;
-    std::atomic<uint64_t> evictions_ttl   = 0;
-    std::atomic<uint64_t> evictions_lru   = 0;
+    uint64_t cache_hits          = 0;
+    uint64_t cache_misses        = 0;
+    uint64_t saves_completed     = 0;
+    uint64_t saves_skipped       = 0;
+    uint64_t restores_completed  = 0;
+    uint64_t total_restore_bytes = 0;
+    uint64_t evictions_ttl       = 0;
+    uint64_t evictions_lru       = 0;
 
     void reset() {
-        cache_hits      = 0;
-        cache_misses    = 0;
-        saves_completed = 0;
-        saves_skipped   = 0;
-        evictions_ttl   = 0;
-        evictions_lru   = 0;
+        cache_hits          = 0;
+        cache_misses        = 0;
+        saves_completed     = 0;
+        saves_skipped       = 0;
+        restores_completed  = 0;
+        total_restore_bytes = 0;
+        evictions_ttl       = 0;
+        evictions_lru       = 0;
     }
 };
 
@@ -138,7 +142,7 @@ class kv_cache_disk_manager {
     // Find matching KV cache entry on disk for given token sequence
     // Returns: filepath string if match found, empty string otherwise
     // Note: Caller must restore using llama_state_seq_load_file API
-    std::string find_cache_entry(const std::vector<int32_t> & tokens, float lcp_threshold);
+    std::string find_cache_entry(const server_tokens & tokens, float lcp_threshold);
 
     // Restore KV cache state from disk file to slot context
     // filepath: path to saved state file
@@ -156,10 +160,10 @@ class kv_cache_disk_manager {
     // Save the current KV cache state to disk after successful generation
     // tokens: token sequence for LCP matching (first N tokens stored)
     // Returns true on success
-    bool save_to_disk(int32_t                      slot_id,
-                      llama_context *              ctx_tgt,
-                      llama_context *              ctx_dft = nullptr,
-                      const std::vector<int32_t> * tokens  = nullptr);
+    bool save_to_disk(int32_t               slot_id,
+                      llama_context *       ctx_tgt,
+                      llama_context *       ctx_dft = nullptr,
+                      const server_tokens * tokens  = nullptr);
 
     // Get current metrics (thread-safe)
     kv_cache_metrics get_metrics() const;
@@ -175,6 +179,9 @@ class kv_cache_disk_manager {
 
     // Calculate LCP ratio between two token sequences (public for use in callbacks)
     float calculate_lcp_ratio(const std::vector<int32_t> & tokens_a, const std::vector<int32_t> & tokens_b) const;
+
+    // Overload for server_tokens
+    float calculate_lcp_ratio(const server_tokens & tokens_a, const std::vector<int32_t> & tokens_b) const;
 
   private:
     // Generate unique filename for a slot's KV cache
