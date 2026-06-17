@@ -1316,7 +1316,12 @@ struct server_context_impl {
                         server_slot & slot                  = slots[i];
                         slot.callback_save_kv_cache_to_disk = [this, &slot]() {
                             // Only save if generation was successful and not cancelled
-                            if (!kv_cache_disk_mgr || !slot.ctx_tgt || slot.task->params.stream) {
+                            if (!kv_cache_disk_mgr || !slot.ctx_tgt) {
+                                return;
+                            }
+
+                            // Skip if task is still active or streaming (task may be null after completion)
+                            if (slot.task && slot.task->params.stream) {
                                 return;
                             }
 
