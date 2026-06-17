@@ -435,46 +435,31 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
     }
 
     // Save KV cache state to file using llama_state_seq_save_file API
-    size_t state_size = llama_state_seq_get_size_ext(ctx_tgt, slot_id, LLAMA_STATE_SEQ_FLAGS_NONE);
-
-    if (state_size == 0) {
-        LOG_WRN("KV cache save: empty state for slot %d\n", slot_id);
-        return false;
-    }
-
-    std::vector<uint8_t> buffer(state_size);
-    size_t               bytes_written =
-        llama_state_seq_get_data_ext(ctx_tgt, buffer.data(), state_size, slot_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    // This ensures compatibility with llama_state_seq_load_file for restore
+    size_t bytes_written = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot_id, tokens, token_count);
 
     if (bytes_written == 0) {
-        LOG_WRN("KV cache save: failed to serialize state for slot %d\n", slot_id);
+        LOG_WRN("KV cache save: failed to save state to '%s'\n", filepath.c_str());
         return false;
     }
 
-    // Replace io_magic with LLAMA_STATE_SEQ_MAGIC for compatibility with llama_state_seq_load_file
-    // io_magic is 0xaf143cd8, LLAMA_STATE_SEQ_MAGIC is 0x67677371
-    const uint32_t io_magic        = 0xaf143cd8;
-    const uint32_t state_seq_magic = 0x67677371;
-    if (bytes_written >= sizeof(uint32_t)) {
-        uint32_t * magic_ptr = reinterpret_cast<uint32_t *>(buffer.data());
-        if (*magic_ptr == io_magic) {
-            *magic_ptr = state_seq_magic;
+    // Verify write completed successfully
+    FILE * fp_check = fopen(filepath.c_str(), "rb");
+    if (fp_check) {
+        fseek(fp_check, 0, SEEK_END);
+        long file_size = ftell(fp_check);
+        fclose(fp_check);
+
+        if (file_size != bytes_written) {
+            LOG_WRN("KV cache save: file size mismatch for '%s' (expected %zu, got %ld)\n", filepath.c_str(),
+                    bytes_written, file_size);
+            remove_entry(filepath);
+            return false;
         }
     }
 
-    // Write to disk
-    FILE * fp = fopen(filepath.c_str(), "wb");
-    if (!fp) {
-        LOG_ERR("KV cache save: cannot open file '%s'\n", filepath.c_str());
-        return false;
-    }
-
-    size_t written = fwrite(buffer.data(), 1, bytes_written, fp);
-    fclose(fp);
-
-    if (written != bytes_written) {
-        LOG_ERR("KV cache save: incomplete write to '%s'\n", filepath.c_str());
-        remove_entry(filepath);
+    if (bytes_written == 0) {
+        LOG_ERR("KV cache save: no bytes written to '%s'\n", filepath.c_str());
         return false;
     }
 
@@ -483,7 +468,7 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
     entry.filepath         = filepath;
     entry.created_at_us    = timestamp_us;
     entry.last_accessed_us = timestamp_us;
-    entry.file_size_bytes  = written;
+    entry.file_size_bytes  = bytes_written;
     entry.seq_id           = slot_id;
 
     // Store token sequence for LCP matching (limit to MAX_TOKENS)
@@ -508,7 +493,7 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
         trie_->insert(entry.tokens, lru_ring_.size() - 1);
     }
 
-    current_size_bytes_ += written;
+    current_size_bytes_ += bytes_written;
     metrics_.saves_completed++;
 
     // Log trie statistics periodically (every 10 saves)
@@ -520,7 +505,7 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
             trie_stats.max_depth, trie_stats.root_branches);
     }
 
-    LOG("KV cache saved: slot=%d, size=%zu bytes, file='%s'\n", slot_id, written, filepath.c_str());
+    LOG("KV cache saved: slot=%d, size=%zu bytes, file='%s'\n", slot_id, bytes_written, filepath.c_str());
 
     return true;
 }
