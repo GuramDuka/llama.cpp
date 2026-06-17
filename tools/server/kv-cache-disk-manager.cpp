@@ -257,14 +257,13 @@ disk_cache_entry * kv_cache_disk_manager::find_matching_entry(const std::vector<
     return valid_candidates.front().entry;
 }
 
-bool kv_cache_disk_manager::try_restore_from_disk(int32_t                      slot_id,
-                                                  const std::vector<int32_t> & tokens,
-                                                  float                        lcp_threshold) {
+// Find matching KV cache entry on disk for given token sequence
+std::string kv_cache_disk_manager::find_cache_entry(const std::vector<int32_t> & tokens, float lcp_threshold) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!trie_ || tokens.empty()) {
         metrics_.cache_misses++;
-        return false;
+        return "";
     }
 
     // Use configured threshold if not explicitly provided
@@ -276,17 +275,51 @@ bool kv_cache_disk_manager::try_restore_from_disk(int32_t                      s
     if (match) {
         metrics_.cache_hits++;
         float actual_lcp = calculate_lcp_ratio(match->tokens, tokens);
-        LOG_DBG(4, "KV cache HIT: slot=%d, LCP=%.3f (threshold=%.3f), file='%s'\n", slot_id, actual_lcp,
-                effective_threshold, match->filepath.c_str());
+        LOG_DBG(4, "KV cache HIT: LCP=%.3f (threshold=%.3f), file='%s'\n", actual_lcp, effective_threshold,
+                match->filepath.c_str());
 
-        // TODO: Implement actual KV state restoration from disk
-        // For now, return true to indicate potential for cache hit
-
-        return true;
+        return match->filepath;
     }
 
     metrics_.cache_misses++;
-    return false;
+    return "";
+}
+
+// Restore KV cache state from disk file to slot context
+bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int32_t slot_id, llama_context * ctx_tgt) {
+    if (!ctx_tgt || filepath.empty()) {
+        LOG_WRN("KV cache restore: invalid parameters\n");
+        return false;
+    }
+
+    // Check file exists before attempting load
+    if (!std::filesystem::exists(filepath)) {
+        LOG_WRN("KV cache restore: file '%s' does not exist\n", filepath.c_str());
+        return false;
+    }
+
+    // Load state from disk using llama_state_seq_load_file API
+    size_t state_size = llama_state_seq_get_size(ctx_tgt, slot_id);
+    if (state_size == 0) {
+        LOG_WRN("KV cache restore: no state allocated for slot %d\n", slot_id);
+        return false;
+    }
+
+    // Load tokens and KV cache into context
+    size_t bytes_loaded = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot_id, nullptr, 0, nullptr);
+
+    if (bytes_loaded == 0) {
+        LOG_WRN("KV cache restore: failed to load state from '%s'\n", filepath.c_str());
+        return false;
+    }
+
+    LOG_INF("KV cache restored: slot=%d, file='%s', bytes=%zu\n", slot_id, filepath.c_str(), bytes_loaded);
+
+    // Update metrics
+    metrics_.restores_completed++;
+    metrics_.total_restore_bytes += bytes_loaded;
+
+    return true;
 }
 
 void kv_cache_disk_manager::set_prompt_similarity_threshold(float threshold) {

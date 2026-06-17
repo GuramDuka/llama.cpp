@@ -135,12 +135,16 @@ class kv_cache_disk_manager {
     // ttl_seconds: time-to-live for cache entries in seconds (0 = no expiration)
     bool initialize(const std::string & cache_dir, float max_size_gb, int64_t ttl_seconds);
 
-    // Check if a slot's KV cache can be restored from disk based on prompt similarity
-    // Returns true if cache hit and slot should be reused
-    // slot_id: target slot ID to restore into
-    // tokens: input token sequence for LCP calculation
-    // lcp_threshold: minimum prefix match ratio (0.0 - 1.0), uses slot_prompt_similarity from params if > 0
-    bool try_restore_from_disk(int32_t slot_id, const std::vector<int32_t> & tokens, float lcp_threshold);
+    // Find matching KV cache entry on disk for given token sequence
+    // Returns: filepath string if match found, empty string otherwise
+    // Note: Caller must restore using llama_state_seq_load_file API
+    std::string find_cache_entry(const std::vector<int32_t> & tokens, float lcp_threshold);
+
+    // Restore KV cache state from disk file to slot context
+    // filepath: path to saved state file
+    // ctx_tgt: target context for restoration
+    // Returns true on success
+    bool restore_from_disk(const std::string & filepath, int32_t slot_id, llama_context * ctx_tgt);
 
     // Set the slot prompt similarity threshold for cache matching
     // This allows tuning sensitivity based on --slot-prompt-similarity parameter
