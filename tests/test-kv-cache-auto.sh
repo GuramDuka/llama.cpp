@@ -1,5 +1,6 @@
 #!/bin/bash
-# Test script for KV cache auto feature - tests both models sequentially
+# Test script for KV cache auto feature - tests models sequentially
+# Downloads models from HuggingFace if not present in models/
 
 set -e
 
@@ -9,9 +10,17 @@ BUILD_DIR="$PROJECT_DIR/build"
 MODEL_DIR="$PROJECT_DIR/models"
 PORT_BASE=8100
 
-MODELS=(
+# Model names and download URLs
+declare -a MODELS=(
     "SmolLM-135M-Instruct.i1-Q4_K_M.gguf"
     "LFM2.5-350M.i1-Q4_K_M.gguf"
+    "Qwen3.5-0.8B.i1-Q4_K_M.gguf"
+)
+
+declare -a DOWNLOAD_URLS=(
+    "https://huggingface.co/mradermacher/SmolLM-135M-Instruct-i1-GGUF/resolve/main/SmolLM-135M-Instruct.i1-Q4_K_M.gguf"
+    "https://huggingface.co/mradermacher/LFM2.5-350M-i1-GGUF/resolve/main/LFM2.5-350M.i1-Q4_K_M.gguf"
+    "https://huggingface.co/mradermacher/Qwen3.5-0.8B-i1-GGUF/resolve/main/Qwen3.5-0.8B.i1-Q4_K_M.gguf"
 )
 
 PASS_COUNT=0
@@ -37,13 +46,43 @@ cleanup_server() {
     fi
 }
 
-for MODEL_FILE in "${MODELS[@]}"; do
-    MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
-    
-    if [ ! -f "$MODEL_PATH" ]; then
-        echo "Model not found: $MODEL_PATH"
-        exit 1
+download_model() {
+    local model_file="$1"
+    local download_url="$2"
+    local model_path="$3"
+
+    if [ -f "$model_path" ]; then
+        echo "  Model already exists: $model_file"
+        return 0
     fi
+
+    mkdir -p "$MODEL_DIR"
+    echo "  Downloading $model_file..."
+    if command -v curl &> /dev/null; then
+        curl -L --progress-bar -o "$model_path" "$download_url"
+    elif command -v wget &> /dev/null; then
+        wget --show-progress -O "$model_path" "$download_url"
+    else
+        echo "  ERROR: Neither curl nor wget found"
+        return 1
+    fi
+
+    if [ -f "$model_path" ]; then
+        echo "  Download complete: $(du -h "$model_path" | cut -f1)"
+    else
+        echo "  ERROR: Download failed for $model_file"
+        return 1
+    fi
+}
+
+for i in "${!MODELS[@]}"; do
+    MODEL_FILE="${MODELS[$i]}"
+    DOWNLOAD_URL="${DOWNLOAD_URLS[$i]}"
+    MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
+
+    echo ""
+    echo "Checking model: $MODEL_FILE"
+    download_model "$MODEL_FILE" "$DOWNLOAD_URL" "$MODEL_PATH" || exit 1
     
     PORT=$((PORT_BASE + RANDOM % 100))
     CACHE_DIR="/tmp/kv-cache-test-$(echo $MODEL_FILE | sed 's/\.gguf//g')"
