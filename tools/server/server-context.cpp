@@ -3803,6 +3803,7 @@ struct server_context_impl {
                     (unsigned long long) metrics.cache_hits, (unsigned long long) metrics.cache_misses,
                     (unsigned long long) metrics.saves_completed, (unsigned long long) metrics.restores_completed,
                     (unsigned long long) metrics.evictions_ttl, (unsigned long long) metrics.evictions_lru);
+                (void) metrics.total_restore_bytes;  // available via get_metrics() if needed
 
                 last_metrics_log = ggml_time_us();
             }

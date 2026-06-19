@@ -130,6 +130,9 @@ class kv_cache_trie {
 
     // Get max depth recursively
     size_t get_max_depth(kv_cache_trie_node * node) const;
+
+    // Helper to remove entry_index from all nodes recursively
+    void remove_entry_recursive(kv_cache_trie_node * node, size_t entry_index);
 };
 
 class kv_cache_disk_manager {

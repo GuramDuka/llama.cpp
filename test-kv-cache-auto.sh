@@ -49,6 +49,9 @@ rm -rf "$CACHE_DIR"
 pkill -f "llama-server.*$SERVER_PORT" 2>/dev/null || true
 sleep 1
 
+# Step 2b: Create cache directory (required by --kv-cache-dir validation)
+mkdir -p "$CACHE_DIR"
+
 # Step 3: Start server with KV cache auto-save enabled
 echo ""
 echo "Step 3: Starting llama-server with KV cache auto-save..."
@@ -59,7 +62,8 @@ log_info "Cache TTL: 3600 seconds (1 hour)"
 ./build/bin/llama-server \
     -m "$MODEL_NAME" \
     --port "$SERVER_PORT" \
-    --kv-cache-auto true \
+    --kv-cache-auto \
+    --kv-cache-dir "$CACHE_DIR" \
     --max-cache-size 1 \
     --cache-ttl 3600 \
     --log-verbosity 4 \
@@ -72,11 +76,13 @@ log_info "Server started with PID: $SERVER_PID"
 # Wait for server to be ready
 echo ""
 echo "Step 4: Waiting for server to be ready..."
-MAX_WAIT=30
+MAX_WAIT=60
 WAIT_COUNT=0
 while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
     if curl -s http://localhost:$SERVER_PORT/health > /dev/null 2>&1; then
         log_info "Server is ready!"
+        # Wait extra time for model to be fully loaded and slots initialized
+        sleep 3
         break
     fi
     WAIT_COUNT=$((WAIT_COUNT + 1))
@@ -106,8 +112,8 @@ FIRST_RESPONSE=$(curl -s http://localhost:$SERVER_PORT/v1/chat/completions \
 echo "$FIRST_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$FIRST_RESPONSE"
 echo ""
 
-# Check for cache miss in logs
-if grep -q "KV cache.*miss\|Cache Miss" server.log 2>/dev/null; then
+# Check for cache miss in logs (case-insensitive)
+if grep -qi "KV cache.*miss\|Cache Miss" server.log 2>/dev/null; then
     log_info "✓ Confirmed: Cache MISS detected in logs"
 else
     log_warn "Could not confirm cache miss in logs"
@@ -143,8 +149,8 @@ SECOND_RESPONSE=$(curl -s http://localhost:$SERVER_PORT/v1/chat/completions \
 echo "$SECOND_RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$SECOND_RESPONSE"
 echo ""
 
-# Check for cache hit in logs
-if grep -q "KV cache.*hit\|Cache Hit" server.log 2>/dev/null; then
+# Check for cache hit in logs (case-insensitive)
+if grep -qi "KV cache.*hit\|Cache Hit" server.log 2>/dev/null; then
     log_info "✓ Confirmed: Cache HIT detected in logs"
 else
     log_warn "Could not confirm cache hit in logs"

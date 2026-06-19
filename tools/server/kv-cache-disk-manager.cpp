@@ -10,10 +10,12 @@
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 // Include llama.cpp headers for KV cache serialization
 extern "C" {
@@ -23,10 +25,6 @@ extern "C" {
 #include "log.h"
 
 using namespace std::chrono_literals;
-
-// ============================================================================
-// kv_cache_trie Implementation
-// ============================================================================
 
 // ============================================================================
 // kv_cache_trie Implementation
@@ -52,21 +50,28 @@ void kv_cache_trie::insert(const std::vector<int32_t> & tokens, size_t entry_ind
         node = node->children->at(token_id).get();
     }
 
-    // Add entry index to the root node (all sequences share this prefix)
-    // This allows LCP matching by checking entries at any depth
-    LOG("KV cache trie insert: adding entry_index=%zu to root node\n", entry_index);
-    root_->entry_indices.push_back(entry_index);
+    // Add entry index to the deepest matching node (end of token sequence)
+    // This enables efficient prefix matching: search traverses the trie and
+    // collects entries from the deepest matching node, which have the longest
+    // common prefix with the query.
+    node->entry_indices.push_back(entry_index);
 }
 
-std::vector<size_t> kv_cache_trie::search_prefix(const std::vector<int32_t> & tokens, float min_similarity) const {
+std::vector<size_t> kv_cache_trie::search_prefix(const std::vector<int32_t> & tokens,
+                                                 float /* min_similarity */) const {
+    // Find the deepest node matching the token prefix
     kv_cache_trie_node * node = find_matching_node(tokens);
     std::vector<size_t>  matching_entries;
 
-    // Collect entries from root node (all sequences share this prefix)
-    if (root_ && !root_->entry_indices.empty()) {
+    // Collect entries from the deepest matching node
+    // This returns entries that share the longest common prefix with the query
+    if (node && !node->entry_indices.empty()) {
+        for (size_t entry_idx : node->entry_indices) {
+            matching_entries.push_back(entry_idx);
+        }
+    } else if (root_ && !root_->entry_indices.empty()) {
+        // Fallback to root if no matching node found
         for (size_t entry_idx : root_->entry_indices) {
-            // Note: Actual similarity check happens in kv_cache_disk_manager
-            // This is a fast pre-filter using trie structure
             matching_entries.push_back(entry_idx);
         }
     }
@@ -75,12 +80,25 @@ std::vector<size_t> kv_cache_trie::search_prefix(const std::vector<int32_t> & to
 }
 
 void kv_cache_trie::remove_entry(size_t entry_index) {
-    // Traverse all nodes and remove entry_index from their lists
-    // For simplicity, we rebuild affected paths
-    // Production code might use more sophisticated deletion
+    // Traverse all nodes and remove entry_index from their entry_indices lists
+    remove_entry_recursive(root_.get(), entry_index);
+}
 
-    // Mark for lazy cleanup - actual removal happens during eviction
-    (void) entry_index;  // Suppress unused warning
+void kv_cache_trie::remove_entry_recursive(kv_cache_trie_node * node, size_t entry_index) {
+    if (!node) {
+        return;
+    }
+
+    // Remove entry_index from this node's list
+    auto & indices = node->entry_indices;
+    indices.erase(std::remove(indices.begin(), indices.end(), entry_index), indices.end());
+
+    // Recurse into children
+    if (node->children) {
+        for (auto & pair : *node->children) {
+            remove_entry_recursive(pair.second.get(), entry_index);
+        }
+    }
 }
 
 kv_cache_trie::stats kv_cache_trie::get_stats() const {
@@ -194,6 +212,10 @@ bool kv_cache_disk_manager::initialize(const std::string & cache_dir, float max_
     }
 
     cache_dir_ = cache_dir;
+    // Ensure cache_dir_ ends with a separator for consistent path construction
+    if (!cache_dir_.empty() && cache_dir_.back() != '/') {
+        cache_dir_ += '/';
+    }
     if (max_size_gb > 0.0f) {
         max_size_bytes_ = static_cast<size_t>(max_size_gb * 1024ULL * 1024ULL * 1024ULL);
     }
@@ -307,7 +329,15 @@ disk_cache_entry * kv_cache_disk_manager::find_matching_entry(const std::vector<
               });
 
     // Return top candidate (highest similarity, LRU if tied)
-    return valid_candidates.front().entry;
+    disk_cache_entry * result = valid_candidates.front().entry;
+
+    // Update LRU position for the matched entry (most recently accessed)
+    auto idx_it = filepath_index_.find(result->filepath);
+    if (idx_it != filepath_index_.end() && idx_it->second < lru_ring_.size()) {
+        lru_ring_[idx_it->second].access_order = ++access_counter_;
+    }
+
+    return result;
 }
 
 // Find matching KV cache entry on disk for given token sequence
@@ -362,18 +392,49 @@ bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int3
         LOG("KV cache restore: file '%s' size=%ld bytes\n", filepath.c_str(), st.st_size);
     }
 
-    // Load tokens and KV cache into context
-    // Note: llama_state_seq_load_file internally handles state allocation via state_read
-    // Using -1 as seq_id to load all streams (not just specific slot)
-    LOG("KV cache restore: attempting load with seq_id=-1 for file '%s'\n", filepath.c_str());
-    size_t bytes_loaded = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), -1, nullptr, 0, nullptr);
+    // Read file header to extract n_token_count (magic 4 + version 4 + n_token_count 4 = 12 bytes)
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file) {
+        LOG_WRN("KV cache restore: cannot open file '%s'\n", filepath.c_str());
+        return false;
+    }
+
+    uint8_t header[12];
+    file.read(reinterpret_cast<char *>(header), 12);
+    if (file.gcount() != 12) {
+        LOG_WRN("KV cache restore: invalid file header size in '%s'\n", filepath.c_str());
+        return false;
+    }
+
+    uint32_t magic         = *(uint32_t *) (header + 0);
+    uint32_t version       = *(uint32_t *) (header + 4);
+    uint32_t n_token_count = *(uint32_t *) (header + 8);
+
+    if (magic != LLAMA_STATE_SEQ_MAGIC) {
+        LOG_WRN("KV cache restore: invalid magic in '%s' (expected 0x%08x, got 0x%08x)\n", filepath.c_str(),
+                LLAMA_STATE_SEQ_MAGIC, magic);
+        return false;
+    }
+
+    LOG("KV cache restore: file version=%u, token_count=%u\n", version, n_token_count);
+
+    // Allocate buffer for token data so llama_state_seq_load_file can copy safely
+    std::vector<llama_token> tokens(n_token_count);
+    size_t                   n_token_count_out = 0;
+
+    // Try restoring with -1 (null seq_id) first
+    LOG("KV cache restore: attempting load with seq_id=-1, n_token_count=%u for file '%s'\n", n_token_count,
+        filepath.c_str());
+    size_t bytes_loaded =
+        llama_state_seq_load_file(ctx_tgt, filepath.c_str(), -1, tokens.data(), n_token_count, &n_token_count_out);
 
     if (bytes_loaded == 0) {
         LOG_WRN("KV cache restore: failed to load state from '%s' with seq_id=-1\n", filepath.c_str());
 
         // Try loading with specific slot_id as fallback
         LOG("KV cache restore: trying with slot_id=%d as fallback\n", slot_id);
-        bytes_loaded = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot_id, nullptr, 0, nullptr);
+        bytes_loaded = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot_id, tokens.data(), n_token_count,
+                                                 &n_token_count_out);
 
         if (bytes_loaded == 0) {
             LOG_WRN("KV cache restore: failed to load state from '%s' with slot_id=%d\n", filepath.c_str(), slot_id);
@@ -412,6 +473,8 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
                                          size_t          token_count) {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    (void) ctx_dft;  // Reserved for future use (e.g., dual-context save)
+
     if (!ctx_tgt) {
         LOG_WRN("KV cache save: no target context\n");
         return false;
@@ -423,7 +486,7 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
 
     // Generate filename
     std::string filename = generate_cache_filename(slot_id, timestamp_us);
-    std::string filepath = cache_dir_ + "/" + filename;
+    std::string filepath = cache_dir_ + filename;
 
     // Check if we need to evict before saving
     if (max_size_bytes_ > 0) {
@@ -451,7 +514,7 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
         long file_size = ftell(fp_check);
         fclose(fp_check);
 
-        if (file_size != bytes_written) {
+        if (static_cast<size_t>(file_size) != bytes_written) {
             LOG_WRN("KV cache save: file size mismatch for '%s' (expected %zu, got %ld)\n", filepath.c_str(),
                     bytes_written, file_size);
             remove_entry(filepath);
@@ -535,7 +598,8 @@ void kv_cache_disk_manager::evict_expired_entries() {
 
         if (age_us > ttl_seconds_) {
             remove_entry(it->metadata.filepath);
-            lru_ring_.erase(it);
+            // Note: remove_entry already erases from lru_ring_ and updates indices
+            ++it;
             metrics_.evictions_ttl++;
         } else {
             ++it;
@@ -560,7 +624,7 @@ bool kv_cache_disk_manager::evict_lru_entry() {
     }
 
     remove_entry(lru_it->metadata.filepath);
-    lru_ring_.erase(lru_it);
+    // Note: remove_entry already erases from lru_ring_ and updates indices
     metrics_.evictions_lru++;
 
     return true;
@@ -581,8 +645,16 @@ void kv_cache_disk_manager::remove_entry(const std::string & filepath) {
         current_size_bytes_ -= file_size;
 
         // Remove from ring buffer
-        if (idx_it->second < lru_ring_.size()) {
-            lru_ring_.erase(lru_ring_.begin() + idx_it->second);
+        size_t erased_idx = idx_it->second;
+        if (erased_idx < lru_ring_.size()) {
+            lru_ring_.erase(lru_ring_.begin() + erased_idx);
+        }
+
+        // Update all indices in filepath_index_ that were after the erased entry
+        for (auto & pair : filepath_index_) {
+            if (pair.second > erased_idx) {
+                --pair.second;
+            }
         }
 
         filepath_index_.erase(idx_it);
@@ -626,15 +698,6 @@ void kv_cache_disk_manager::reconcile_orphaned_files() {
             // Check if file is in our index
             if (filepath_index_.find(filepath) == filepath_index_.end()) {
                 LOG("KV cache reconciliation: removing orphaned file '%s'\n", filepath.c_str());
-
-                size_t file_size = 0;
-                try {
-                    file_size = std::filesystem::file_size(filepath);
-                } catch (...) {
-                    file_size = 0;
-                }
-
-                current_size_bytes_ -= file_size;
                 std::filesystem::remove(filepath);
             }
         }
@@ -652,7 +715,8 @@ void kv_cache_disk_manager::purge_all_cache_files() {
 
     LOG("KV cache purge: removing all files from '%s'\n", cache_dir_.c_str());
 
-    size_t total_freed = 0;
+    size_t total_freed   = 0;
+    size_t files_removed = 0;
 
     for (const auto & entry : std::filesystem::directory_iterator(cache_dir_)) {
         if (!entry.is_regular_file()) {
@@ -664,8 +728,18 @@ void kv_cache_disk_manager::purge_all_cache_files() {
         // Remove from index tracking
         auto idx_it = filepath_index_.find(filepath);
         if (idx_it != filepath_index_.end()) {
-            lru_ring_.erase(lru_ring_.begin() + idx_it->second);
+            size_t erased_idx = idx_it->second;
+            if (erased_idx < lru_ring_.size()) {
+                lru_ring_.erase(lru_ring_.begin() + erased_idx);
+            }
+            // Update all remaining indices
+            for (auto & pair : filepath_index_) {
+                if (pair.second > erased_idx) {
+                    --pair.second;
+                }
+            }
             filepath_index_.erase(idx_it);
+            files_removed++;
         }
 
         // Delete file from disk
@@ -679,5 +753,5 @@ void kv_cache_disk_manager::purge_all_cache_files() {
         }
     }
 
-    LOG("KV cache purge complete: freed %zu bytes, removed %zu files\n", total_freed, lru_ring_.size());
+    LOG("KV cache purge complete: freed %zu bytes, removed %zu files\n", total_freed, files_removed);
 }
