@@ -792,39 +792,17 @@ void kv_cache_disk_manager::purge_all_cache_files() {
     size_t total_freed   = 0;
     size_t files_removed = 0;
 
+    // Collect filepaths first to avoid modifying lru_ring_ while iterating
+    std::vector<std::string> filepaths;
     for (const auto & entry : std::filesystem::directory_iterator(cache_dir_)) {
-        if (!entry.is_regular_file()) {
-            continue;
+        if (entry.is_regular_file()) {
+            filepaths.push_back(entry.path().string());
         }
+    }
 
-        const std::string filepath = entry.path().string();
-
-        // Remove from index tracking
-        auto idx_it = filepath_index_.find(filepath);
-        if (idx_it != filepath_index_.end()) {
-            size_t erased_idx = idx_it->second;
-            if (erased_idx < lru_ring_.size()) {
-                lru_ring_.erase(lru_ring_.begin() + erased_idx);
-            }
-            // Update all remaining indices
-            for (auto & pair : filepath_index_) {
-                if (pair.second > erased_idx) {
-                    --pair.second;
-                }
-            }
-            filepath_index_.erase(idx_it);
-            files_removed++;
-        }
-
-        // Delete file from disk
-        try {
-            size_t file_size = std::filesystem::file_size(filepath);
-            total_freed += file_size;
-            current_size_bytes_ -= file_size;
-            std::filesystem::remove(filepath);
-        } catch (...) {
-            // Ignore errors during purge
-        }
+    for (const auto & filepath : filepaths) {
+        remove_entry(filepath);
+        files_removed++;
     }
 
     LOG("KV cache purge complete: freed %zu bytes, removed %zu files\n", total_freed, files_removed);

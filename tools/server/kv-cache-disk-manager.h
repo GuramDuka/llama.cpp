@@ -56,11 +56,10 @@ struct disk_cache_entry {
         if (ttl_seconds <= 0) {
             return false;
         }
-        int64_t age_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                             std::chrono::steady_clock::now() - std::chrono::time_point<std::chrono::steady_clock>(
-                                                                    std::chrono::nanoseconds(created_at_us)))
-                             .count();
-        return (age_us / 1000000) > ttl_seconds;
+        int64_t now_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        return ((now_us - created_at_us) / 1000000) > ttl_seconds;
     }
 };
 
