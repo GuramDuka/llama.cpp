@@ -562,8 +562,8 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
     // Evict expired entries before saving
     evict_expired_entries();
 
-    // Get current timestamp
-    auto    now          = std::chrono::steady_clock::now();
+    // Get current timestamp (system_clock for TTL comparison consistency)
+    auto    now          = std::chrono::system_clock::now();
     int64_t timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
 
     // Generate filename
@@ -651,7 +651,6 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
     return true;
 }
 
-// Overload for convenience (backward compatible - assumes token_count from tokens pointer)
 void kv_cache_disk_manager::evict_expired_entries() {
     if (ttl_seconds_ <= 0) {
         return;
