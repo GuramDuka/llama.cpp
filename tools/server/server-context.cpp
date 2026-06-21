@@ -1310,9 +1310,6 @@ struct server_context_impl {
                     // Set prompt similarity threshold from parameters
                     kv_cache_disk_mgr->set_prompt_similarity_threshold(params_base.slot_prompt_similarity);
 
-                    // Reconcile orphaned files on startup
-                    kv_cache_disk_mgr->reconcile_orphaned_files();
-
                     // Install KV cache save callback for all slots
                     // Note: slot.ctx_tgt and slot.ctx_dft are set in load_model loop before this
                     for (int i = 0; i < params_base.n_parallel; i++) {

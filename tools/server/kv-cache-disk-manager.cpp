@@ -201,7 +201,7 @@ kv_cache_disk_manager::~kv_cache_disk_manager() {
 }
 
 bool kv_cache_disk_manager::initialize(const std::string & cache_dir, float max_size_gb, int64_t ttl_seconds) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     // Create cache directory if it doesn't exist
     try {
@@ -221,8 +221,84 @@ bool kv_cache_disk_manager::initialize(const std::string & cache_dir, float max_
     }
     ttl_seconds_ = ttl_seconds;
 
-    fprintf(stderr, "KV cache disk manager initialized: dir='%s', max_size=%.1f GB, ttl=%ld s\n", cache_dir.c_str(),
-            max_size_gb, (long) ttl_seconds);
+    // Rebuild in-memory index from existing cache files on disk
+    try {
+        int rebuild_count = 0;
+        for (const auto & file_entry : std::filesystem::directory_iterator(cache_dir_)) {
+            if (!file_entry.is_regular_file()) {
+                continue;
+            }
+
+            std::string filepath = file_entry.path().string();
+
+            // Read file header (magic 4 + version 4 + n_token_count 4 = 12 bytes)
+            std::ifstream file(filepath, std::ios::binary);
+            if (!file) {
+                continue;
+            }
+
+            uint8_t header[12];
+            file.read(reinterpret_cast<char *>(header), 12);
+            if (file.gcount() != 12) {
+                continue;
+            }
+
+            uint32_t magic         = *(uint32_t *) (header + 0);
+            uint32_t n_token_count = *(uint32_t *) (header + 8);
+
+            // Validate magic
+            if (magic != LLAMA_STATE_SEQ_MAGIC) {
+                LOG("KV cache rebuild: invalid magic in '%s', skipping\n", filepath.c_str());
+                continue;
+            }
+
+            // Read tokens
+            std::vector<int32_t> tokens(n_token_count);
+            file.read(reinterpret_cast<char *>(tokens.data()), sizeof(int32_t) * n_token_count);
+            file.close();
+
+            // Build cache entry
+            disk_cache_entry entry;
+            entry.filepath        = filepath;
+            entry.file_size_bytes = static_cast<size_t>(file_entry.file_size());
+            // Use system_clock for file age tracking (matches file timestamps)
+            auto file_time =
+                std::chrono::system_clock::from_time_t(file_entry.last_write_time().time_since_epoch().count());
+            entry.created_at_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(file_time.time_since_epoch()).count();
+            entry.last_accessed_us = entry.created_at_us;
+            entry.seq_id           = 0;
+            entry.tokens           = std::move(tokens);
+
+            // Add to LRU ring
+            ring_buffer_entry rbe;
+            rbe.metadata     = entry;
+            rbe.access_order = ++access_counter_;
+            lru_ring_.push_back(rbe);
+            filepath_index_[filepath] = lru_ring_.size() - 1;
+
+            // Insert into Radix Tree for efficient prefix matching
+            if (trie_ && !entry.tokens.empty()) {
+                trie_->insert(entry.tokens, lru_ring_.size() - 1);
+            }
+
+            current_size_bytes_ += entry.file_size_bytes;
+            rebuild_count++;
+        }
+
+        if (rebuild_count > 0) {
+            LOG("KV cache rebuild: restored %d entries from disk (total %zu bytes)\n", rebuild_count,
+                current_size_bytes_);
+        }
+    } catch (const std::exception & e) {
+        LOG_ERR("KV cache: failed to rebuild index from disk: %s\n", e.what());
+    }
+
+    // Now reconcile is safe -- all valid files are in the index
+    reconcile_orphaned_files();
+
+    fprintf(stderr, "KV cache disk manager initialized: dir='%s', max_size=%.1f GB, ttl=%ld s, entries=%zu\n",
+            cache_dir.c_str(), max_size_gb, (long) ttl_seconds, lru_ring_.size());
 
     return true;
 }
@@ -342,7 +418,10 @@ disk_cache_entry * kv_cache_disk_manager::find_matching_entry(const std::vector<
 
 // Find matching KV cache entry on disk for given token sequence
 std::string kv_cache_disk_manager::find_cache_entry(const llama_tokens & tokens, float lcp_threshold) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    // Evict expired entries before searching
+    evict_expired_entries();
 
     if (!trie_ || tokens.empty()) {
         metrics_.cache_misses++;
@@ -457,7 +536,7 @@ bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int3
 }
 
 void kv_cache_disk_manager::set_prompt_similarity_threshold(float threshold) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     prompt_similarity_threshold_ = threshold;
     LOG("KV cache prompt similarity threshold set to %.3f\n", threshold);
 }
@@ -471,7 +550,7 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
                                          llama_context * ctx_dft,
                                          const int32_t * tokens,
                                          size_t          token_count) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     (void) ctx_dft;  // Reserved for future use (e.g., dual-context save)
 
@@ -479,6 +558,9 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
         LOG_WRN("KV cache save: no target context\n");
         return false;
     }
+
+    // Evict expired entries before saving
+    evict_expired_entries();
 
     // Get current timestamp
     auto    now          = std::chrono::steady_clock::now();
@@ -520,11 +602,6 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
             remove_entry(filepath);
             return false;
         }
-    }
-
-    if (bytes_written == 0) {
-        LOG_ERR("KV cache save: no bytes written to '%s'\n", filepath.c_str());
-        return false;
     }
 
     // Update metadata
@@ -575,35 +652,27 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
 }
 
 // Overload for convenience (backward compatible - assumes token_count from tokens pointer)
-bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
-                                         llama_context * ctx_tgt,
-                                         llama_context * ctx_dft,
-                                         const int32_t * tokens) {
-    // This overload doesn't know the token count, so it won't store tokens for matching
-    return save_to_disk(slot_id, ctx_tgt, ctx_dft, tokens, 0);
-}
-
 void kv_cache_disk_manager::evict_expired_entries() {
-    std::lock_guard<std::mutex> lock(mutex_);
-
     if (ttl_seconds_ <= 0) {
         return;
     }
 
-    auto    now    = std::chrono::steady_clock::now();
+    auto    now    = std::chrono::system_clock::now();
     int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
 
-    for (auto it = lru_ring_.begin(); it != lru_ring_.end();) {
-        int64_t age_us = (now_us - it->metadata.created_at_us) / 1000000;
+    // Collect expired filepaths first, then remove (to avoid iterator invalidation)
+    std::vector<std::string> expired;
+    for (const auto & entry : lru_ring_) {
+        int64_t age_us = (now_us - entry.metadata.created_at_us) / 1000000;
 
         if (age_us > ttl_seconds_) {
-            remove_entry(it->metadata.filepath);
-            // Note: remove_entry already erases from lru_ring_ and updates indices
-            ++it;
-            metrics_.evictions_ttl++;
-        } else {
-            ++it;
+            expired.push_back(entry.metadata.filepath);
         }
+    }
+
+    for (const auto & filepath : expired) {
+        remove_entry(filepath);
+        metrics_.evictions_ttl++;
     }
 }
 
@@ -646,6 +715,12 @@ void kv_cache_disk_manager::remove_entry(const std::string & filepath) {
 
         // Remove from ring buffer
         size_t erased_idx = idx_it->second;
+
+        // Remove from trie BEFORE modifying lru_ring_ (indices become stale)
+        if (trie_) {
+            trie_->remove_entry(erased_idx);
+        }
+
         if (erased_idx < lru_ring_.size()) {
             lru_ring_.erase(lru_ring_.begin() + erased_idx);
         }
@@ -681,7 +756,7 @@ void kv_cache_disk_manager::reset_metrics() {
 }
 
 void kv_cache_disk_manager::reconcile_orphaned_files() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     if (cache_dir_.empty()) {
         return;
@@ -707,7 +782,7 @@ void kv_cache_disk_manager::reconcile_orphaned_files() {
 }
 
 void kv_cache_disk_manager::purge_all_cache_files() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     if (cache_dir_.empty()) {
         return;

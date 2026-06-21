@@ -173,12 +173,6 @@ class kv_cache_disk_manager {
                       const int32_t * tokens      = nullptr,
                       size_t          token_count = 0);
 
-    // Overload for convenience (backward compatible)
-    bool save_to_disk(int32_t         slot_id,
-                      llama_context * ctx_tgt,
-                      llama_context * ctx_dft = nullptr,
-                      const int32_t * tokens  = nullptr);
-
     // Get current metrics (thread-safe)
     kv_cache_metrics get_metrics() const;
 
@@ -217,7 +211,7 @@ class kv_cache_disk_manager {
     void update_cache_size(int64_t delta_bytes);
 
     // Thread-safe access to cache index
-    std::mutex mutex_;
+    std::recursive_mutex mutex_;
 
     // Configuration
     std::string cache_dir_;

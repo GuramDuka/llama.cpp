@@ -173,7 +173,105 @@ for i in "${!MODELS[@]}"; do
         echo "  No files found in $CACHE_DIR"
     fi
     
-    # Test 5: Check for KV cache metrics logging
+    # Test 5: Restart server and verify trie rebuild from disk
+    echo ""
+    echo "--- Test 5: Server Restart (Trie Rebuild) ---"
+
+    # Stop server
+    cleanup_server "$SERVER_PID"
+    sleep 2
+
+    # Start server again with same cache dir
+    echo "Restarting server with same cache dir..."
+    "$BUILD_DIR/bin/llama-server" \
+        --model "$MODEL_PATH" \
+        --port "$PORT" \
+        --kv-cache-auto \
+        --max-cache-size 1 \
+        --cache-ttl 3600 \
+        --kv-cache-dir "$CACHE_DIR" \
+        -lv 4 \
+        > "$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+
+    sleep 15
+
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "Server failed to restart!"
+        tail -30 "$SERVER_LOG"
+        cleanup_server "$SERVER_PID"
+        exit 1
+    fi
+
+    echo "✓ Server restarted (PID: $SERVER_PID)"
+
+    # Check trie rebuild log
+    REBUILD_LOG=$(grep -c "KV cache rebuild" "$SERVER_LOG" 2>/dev/null || echo "0")
+    if [ "$REBUILD_LOG" -gt 0 ]; then
+        run_check "Trie rebuild from disk confirmed ($REBUILD_LOG message(s))" "true"
+        echo "  Rebuild log: $(grep 'KV cache rebuild' "$SERVER_LOG" | head -1)"
+    else
+        run_check "Trie rebuild from disk confirmed" "false"
+    fi
+
+    # Check that cache files survived (not deleted by reconcile_orphaned_files)
+    CACHE_FILES_AFTER_RESTART=$(ls "$CACHE_DIR"/* 2>/dev/null | wc -l)
+    if [ "$CACHE_FILES_AFTER_RESTART" -gt 0 ]; then
+        run_check "Cache files survived restart ($CACHE_FILES_AFTER_RESTART file(s))" "true"
+    else
+        run_check "Cache files survived restart" "false"
+    fi
+
+    # Make same request again -- should HIT from rebuilt trie
+    RESPONSE2=$(curl -s --max-time 60 http://localhost:$PORT/v1/chat/completions \
+        -H "Content-Type: application/json" \
+        -d '{
+            "model": "test",
+            "messages": [{"role": "user", "content": "Tell me a short joke"}]
+        }' 2>/dev/null || echo "")
+
+    if [ -n "$RESPONSE2" ]; then
+        run_check "Request after restart response received" "true"
+    else
+        run_check "Request after restart response received" "false"
+    fi
+
+    # Check for cache hit after restart
+    if grep -qi "KV cache.*HIT\|KV cache HIT" "$SERVER_LOG" 2>/dev/null; then
+        run_check "Cache HIT after restart (trie restored from disk)" "true"
+    else
+        run_check "Cache HIT after restart (trie restored from disk)" "false"
+        echo "  Note: cache MISS after restart may indicate trie rebuild bug"
+    fi
+
+    # Stop server again (will be restarted for next tests)
+    cleanup_server "$SERVER_PID"
+    sleep 2
+
+    # Start server again for remaining tests
+    echo "Restarting server for remaining tests..."
+    rm -f "$SERVER_LOG"
+    "$BUILD_DIR/bin/llama-server" \
+        --model "$MODEL_PATH" \
+        --port "$PORT" \
+        --kv-cache-auto \
+        --max-cache-size 1 \
+        --cache-ttl 3600 \
+        --kv-cache-dir "$CACHE_DIR" \
+        -lv 4 \
+        > "$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+
+    sleep 15
+
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "Server failed to restart for remaining tests!"
+        tail -30 "$SERVER_LOG"
+        cleanup_server "$SERVER_PID"
+        exit 1
+    fi
+
+    # Test 6: Check for KV cache metrics logging
     echo ""
     echo "--- Test 5: Metrics Logging ---"
     grep -q "KV cache stats" "$SERVER_LOG" && run_check "KV cache metrics logged" "true" || run_check "KV cache metrics logged (may take 5 min)" "false"
@@ -183,7 +281,7 @@ for i in "${!MODELS[@]}"; do
         echo "  Metrics: $METRICS"
     fi
     
-    # Test 6: Check callback invocation logs
+    # Test 7: Check callback invocation logs
     echo ""
     echo "--- Test 6: Callback Invocation ---"
     CALLBACK_INVOKED=$(grep -c "KV cache callback invoked" "$SERVER_LOG" 2>/dev/null || echo "0")
@@ -195,7 +293,7 @@ for i in "${!MODELS[@]}"; do
         echo "  Callback may not have been called or logged at this verbosity level"
     fi
     
-    # Test 7: Check KV cache save logs
+    # Test 8: Check KV cache save logs
     echo ""
     echo "--- Test 7: KV Cache Save Logs ---"
     SAVE_LOGS=$(grep -c "KV cache saved" "$SERVER_LOG" 2>/dev/null || echo "0")
