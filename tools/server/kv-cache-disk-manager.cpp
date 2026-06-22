@@ -55,6 +55,9 @@ void kv_cache_trie::insert(const std::vector<int32_t> & tokens, size_t entry_ind
     // collects entries from the deepest matching node, which have the longest
     // common prefix with the query.
     node->entry_indices.push_back(entry_index);
+    LOG("KV cache trie insert done: root=%p, depth_node=%p, tokens=%zu, entry_index=%zu, "
+        "node.entry_indices.size()=%zu\n",
+        (void *) root_.get(), (void *) node, tokens.size(), entry_index, node->entry_indices.size());
 }
 
 std::vector<size_t> kv_cache_trie::search_prefix(const std::vector<int32_t> & tokens,
@@ -62,6 +65,14 @@ std::vector<size_t> kv_cache_trie::search_prefix(const std::vector<int32_t> & to
     // Find the deepest node matching the token prefix
     kv_cache_trie_node * node = find_matching_node(tokens);
     std::vector<size_t>  matching_entries;
+
+    LOG("KV cache search_prefix: root=%p, node=%p, node->entry_indices.size()=%zu\n", (void *) root_.get(),
+        (void *) node, node ? node->entry_indices.size() : 0);
+    if (node) {
+        for (size_t idx : node->entry_indices) {
+            LOG("KV cache search_prefix:   entry_index=%zu\n", idx);
+        }
+    }
 
     // Collect entries from the deepest matching node
     // This returns entries that share the longest common prefix with the query
@@ -261,11 +272,25 @@ bool kv_cache_disk_manager::initialize(const std::string & cache_dir, float max_
             disk_cache_entry entry;
             entry.filepath        = filepath;
             entry.file_size_bytes = static_cast<size_t>(file_entry.file_size());
-            // Use system_clock for file age tracking (matches file timestamps)
-            auto file_time =
-                std::chrono::system_clock::from_time_t(file_entry.last_write_time().time_since_epoch().count());
-            entry.created_at_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(file_time.time_since_epoch()).count();
+            // Use stat to get file mtime in seconds since Unix epoch.
+            // file_time_type has a different epoch from system_clock,
+            // so time_since_epoch() cannot be compared with system_clock.
+            struct stat st;
+            if (stat(filepath.c_str(), &st) != 0) {
+                LOG("KV cache rebuild: stat failed on '%s', skipping\n", filepath.c_str());
+                continue;
+            }
+            entry.created_at_us = st.st_mtime * 1000000LL;
+            LOG("KV cache rebuild: file='%s', created_at_us=%ld, now_us=%ld, age_s=%ld\n", filepath.c_str(),
+                (long) entry.created_at_us,
+                (long) std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count(),
+                (long) ((std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count() -
+                         entry.created_at_us) /
+                        1000000));
             entry.last_accessed_us = entry.created_at_us;
             entry.seq_id           = 0;
             entry.tokens           = std::move(tokens);
@@ -279,6 +304,8 @@ bool kv_cache_disk_manager::initialize(const std::string & cache_dir, float max_
 
             // Insert into Radix Tree for efficient prefix matching
             if (trie_ && !entry.tokens.empty()) {
+                LOG("KV cache rebuild: inserting %zu tokens at entry_index=%zu\n", entry.tokens.size(),
+                    lru_ring_.size() - 1);
                 trie_->insert(entry.tokens, lru_ring_.size() - 1);
             }
 
@@ -667,10 +694,14 @@ void kv_cache_disk_manager::evict_expired_entries() {
     auto    now    = std::chrono::system_clock::now();
     int64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
 
+    LOG("KV cache evict_expired_entries: checking %zu entries\n", lru_ring_.size());
+
     // Collect expired filepaths first, then remove (to avoid iterator invalidation)
     std::vector<std::string> expired;
     for (const auto & entry : lru_ring_) {
         int64_t age_us = (now_us - entry.metadata.created_at_us) / 1000000;
+        LOG("KV cache evict_expired_entries: file='%s', age=%ld s, ttl=%ld s\n", entry.metadata.filepath.c_str(),
+            (long) age_us, (long) ttl_seconds_);
 
         if (age_us > ttl_seconds_) {
             expired.push_back(entry.metadata.filepath);
@@ -681,6 +712,7 @@ void kv_cache_disk_manager::evict_expired_entries() {
         remove_entry(filepath);
         metrics_.evictions_ttl++;
     }
+    LOG("KV cache evict_expired_entries: expired=%zu, lru_ring_ size=%zu\n", expired.size(), lru_ring_.size());
 }
 
 bool kv_cache_disk_manager::evict_lru_entry() {
