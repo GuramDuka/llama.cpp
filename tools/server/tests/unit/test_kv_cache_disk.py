@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import pytest
 from utils import *
 
@@ -32,11 +33,19 @@ def create_server():
     server.temperature = 0.0
     server.cache_ram = 100
     server.kv_cache_auto = True
+    server.kv_cache_dir = tempfile.mkdtemp(prefix="kv-cache-test-")
     server.max_cache_size_gb = 1.0
     server.cache_ttl_seconds = 3600
     fd, server.log_path = tempfile.mkstemp(suffix=".log")
     os.close(fd)
     yield
+    # Cleanup: remove the cache directory
+    import shutil
+
+    try:
+        shutil.rmtree(server.kv_cache_dir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
