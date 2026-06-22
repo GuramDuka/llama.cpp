@@ -545,6 +545,14 @@ float kv_cache_disk_manager::get_prompt_similarity_threshold() const {
     return prompt_similarity_threshold_;
 }
 
+float kv_cache_disk_manager::get_disk_lcp(const std::string & filepath, const std::vector<int32_t> & tokens) const {
+    auto it = filepath_index_.find(filepath);
+    if (it == filepath_index_.end() || it->second >= lru_ring_.size()) {
+        return 0.0f;
+    }
+    return calculate_lcp_ratio(lru_ring_[it->second].metadata.tokens, tokens);
+}
+
 bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
                                          llama_context * ctx_tgt,
                                          llama_context * ctx_dft,

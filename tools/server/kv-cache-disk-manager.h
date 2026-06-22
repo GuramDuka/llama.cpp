@@ -172,6 +172,9 @@ class kv_cache_disk_manager {
                       const int32_t * tokens      = nullptr,
                       size_t          token_count = 0);
 
+    // Get the LCP ratio between a disk cache entry (identified by filepath) and a token sequence
+    float get_disk_lcp(const std::string & filepath, const std::vector<int32_t> & tokens) const;
+
     // Get current metrics (thread-safe)
     kv_cache_metrics get_metrics() const;
 

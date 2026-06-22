@@ -1451,35 +1451,58 @@ struct server_context_impl {
         bool update_cache = false;
 
         // Try to restore from disk cache if enabled (BEFORE prompt similarity matching)
-        if (ret == nullptr && params_base.kv_cache_auto && kv_cache_disk_mgr) {
+        if (params_base.kv_cache_auto && kv_cache_disk_mgr) {
             float lcp_threshold = slot_prompt_similarity;
 
+            // Single disk cache search (not per-slot)
+            std::string cache_file = kv_cache_disk_mgr->find_cache_entry(task.tokens.get_tokens(), lcp_threshold);
+
+            // Compute disk LCP if a match was found
+            float disk_lcp = 0.0f;
+            if (!cache_file.empty()) {
+                disk_lcp = kv_cache_disk_mgr->get_disk_lcp(cache_file, task.tokens.get_tokens());
+            }
+
+            // Find best RAM LCP among free slots (KV cache already on GPU)
+            float best_ram_lcp = 0.0f;
             for (server_slot & slot : slots) {
-                // skip the slot if it is not available
                 if (slot.is_processing()) {
                     continue;
                 }
 
-                // Try to restore from disk with sorted candidate selection
-                std::string cache_file = kv_cache_disk_mgr->find_cache_entry(task.tokens.get_tokens(), lcp_threshold);
+                if (!slot.prompt.tokens.empty()) {
+                    float ram_lcp = float(slot.prompt.tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+                    if (ram_lcp > best_ram_lcp) {
+                        best_ram_lcp = ram_lcp;
+                    }
+                }
+            }
 
-                LOG("KV cache auto: checking slot %d, cache_file='%s'\n", slot.id, cache_file.c_str());
+            // Compare: disk wins only if its LCP is strictly greater than RAM
+            if (disk_lcp > best_ram_lcp && !cache_file.empty()) {
+                // Disk cache wins - restore from disk to first free slot
+                for (server_slot & slot : slots) {
+                    if (slot.is_processing()) {
+                        continue;
+                    }
 
-                if (!cache_file.empty()) {
-                    // Found matching cache entry - try to restore KV state
                     LOG("KV cache auto: attempting restore for slot %d from '%s'\n", slot.id, cache_file.c_str());
                     if (kv_cache_disk_mgr->restore_from_disk(cache_file, slot.id, ctx_tgt)) {
                         ret = &slot;
-                        SLT_INF(*ret, "restored slot from disk cache (LCP hit)\n");
+                        SLT_INF(*ret, "restored slot from disk cache (disk LCP=%.3f > ram LCP=%.3f)\n", disk_lcp,
+                                best_ram_lcp);
                         break;
                     } else {
                         LOG_WRN("Failed to restore KV state for slot %d\n", slot.id);
                     }
                 }
-            }
 
-            if (ret) {
-                return ret;  // Skip prompt cache update and LRU selection
+                if (ret) {
+                    return ret;  // Skip prompt cache update and LRU selection
+                }
+            } else if (best_ram_lcp > disk_lcp) {
+                LOG_INF("RAM cache preferred (ram LCP=%.3f >= disk LCP=%.3f, skip disk restore)\n", best_ram_lcp,
+                        disk_lcp);
             }
         }
 
