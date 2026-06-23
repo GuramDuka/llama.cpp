@@ -38,7 +38,7 @@ class LogReader:
         self.pos = 0
 
     def drain(self) -> str:
-        with open(self.path) as f:
+        with open(self.path, encoding="utf-8", errors="replace") as f:
             f.seek(self.pos)
             content = f.read()
             self.pos = f.tell()
@@ -368,6 +368,8 @@ def test_multi_model_smoke():
         s.n_predict = 8
         s.temperature = 0.0
         s.model_file = model_path
+        s.model_hf_repo = None
+        s.model_hf_file = None
         s.offline = True
         s.kv_cache_auto = True
         s.kv_cache_dir = cache_dir
