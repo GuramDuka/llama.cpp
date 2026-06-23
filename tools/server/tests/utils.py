@@ -106,7 +106,6 @@ class ServerProcess:
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
     kv_cache_auto: bool | None = None
-    kv_cache_dir: str | None = None
     max_cache_size_gb: float | None = None
     cache_ttl_seconds: int | None = None
     no_cache_idle_slots: bool = False
@@ -257,8 +256,6 @@ class ServerProcess:
             server_args.extend(["--cache-ram", self.cache_ram])
         if self.kv_cache_auto:
             server_args.append("--kv-cache-auto")
-        if self.kv_cache_dir:
-            server_args.extend(["--kv-cache-dir", self.kv_cache_dir])
         if self.max_cache_size_gb is not None:
             server_args.extend(["--max-cache-size", self.max_cache_size_gb])
         if self.cache_ttl_seconds is not None:

@@ -1286,18 +1286,10 @@ struct server_context_impl {
 
         // Initialize automatic KV cache disk manager if enabled
         if (params_base.kv_cache_auto) {
-            std::string cache_dir;
-
-            if (!params_base.kv_cache_dir.empty()) {
-                cache_dir = params_base.kv_cache_dir;
-            } else if (!params_base.slot_save_path.empty()) {
-                // Default: slot-save-path + "/kv-meta"
-                cache_dir = params_base.slot_save_path + "kv-meta";
+            if (params_base.slot_save_path.empty()) {
+                SRV_WRN("KV cache auto enabled but slot-save-path is empty\n");
             } else {
-                SRV_WRN("KV cache auto enabled but no directory configured (slot-save-path is empty)\n");
-            }
-
-            if (!cache_dir.empty()) {
+                std::string cache_dir = params_base.slot_save_path;
                 // Create directory if needed
                 std::filesystem::create_directories(cache_dir);
 

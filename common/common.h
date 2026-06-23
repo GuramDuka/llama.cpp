@@ -622,10 +622,9 @@ struct common_params {
     int  sleep_idle_seconds = -1;    // if >0, server will sleep after this many seconds of idle time
 
     // Automatic KV cache disk persistence (disabled by default)
-    bool        kv_cache_auto     = false;  // enable automatic KV cache save/restore on disk
-    float       max_cache_size_gb = 8.0f;   // maximum total cache size per backend in GB
-    int64_t     cache_ttl_seconds = 3600;   // delete cache files older than this (0 = disabled)
-    std::string kv_cache_dir;  // directory for automatic KV cache storage (default: slot-save-path + "/kv-meta")
+    bool    kv_cache_auto     = false;  // enable automatic KV cache save/restore on disk
+    float   max_cache_size_gb = 8.0f;   // maximum total cache size per backend in GB
+    int64_t cache_ttl_seconds = 3600;   // delete cache files older than this (0 = disabled)
 
     std::vector<std::string> api_keys;
 

@@ -36,10 +36,7 @@ std::unique_ptr<kv_cache_disk_manager> kv_cache_disk_mgr;
 
 Location: `server_context_impl::load_model()`, lines 1288-1355.
 
-The cache directory is determined in this order:
-1. `--kv-cache-dir` if explicitly set
-2. `--slot-save-path + "kv-meta"` if available
-3. Feature is disabled with a warning if neither is available
+The cache directory is `--slot-save-path`. If it is empty, the feature is disabled with a warning.
 
 After initialization, the prompt similarity threshold is set from `--slot-prompt-similarity` and a save callback is installed per slot.
 
@@ -90,7 +87,7 @@ Location: main loop, lines 3814-3820. Metrics are logged every 300 seconds when 
 ## CLI Usage
 
 ```bash
-# Enable with default directory
+# Enable KV cache auto (requires --slot-save-path)
 ./build/bin/llama-server \
     -m model.gguf \
     --port 8080 \
@@ -99,20 +96,10 @@ Location: main loop, lines 3814-3820. Metrics are logged every 300 seconds when 
     --max-cache-size 2 \
     --cache-ttl 7200
 
-# With custom directory
-./build/bin/llama-server \
-    -m model.gguf \
-    --port 8080 \
-    --kv-cache-auto \
-    --kv-cache-dir /data/kv-cache \
-    --max-cache-size 4 \
-    --cache-ttl 3600
-
 # Check parameters in common.h
 #   kv_cache_auto        = false   (disabled by default)
 #   max_cache_size_gb    = 8.0f
 #   cache_ttl_seconds    = 3600
-#   kv_cache_dir         = (empty, auto)
 ```
 
 ---
@@ -166,10 +153,8 @@ grep "KV cache HIT\|KV cache MISS\|restored slot from disk" server.log
 ### Default Directory Logic
 
 ```
-if (--kv-cache-dir is set)
-    use --kv-cache-dir
-else if (--slot-save-path is set)
-    use --slot-save-path + "kv-meta"
+if (--slot-save-path is set)
+    use --slot-save-path
 else
     disable auto-save (warning logged)
 ```
