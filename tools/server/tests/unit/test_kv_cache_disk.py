@@ -5,6 +5,28 @@ import shutil
 import pytest
 from utils import *
 
+# Models for multi-model testing (mirrors shell script MODELS array)
+# Each tuple: (model_name, hf_repo, hf_file)
+KV_TEST_MODELS = [
+    # Primary model — detailed tests (4 parallel slots)
+    (
+        "SmolLM-135M-Instruct.i1-Q4_K_M.gguf",
+        "mradermacher/SmolLM-135M-Instruct-i1-GGUF",
+        "SmolLM-135M-Instruct.i1-Q4_K_M.gguf",
+    ),
+    # Secondary models — lightweight smoke tests
+    (
+        "LFM2.5-350M.i1-Q4_K_M.gguf",
+        "mradermacher/LFM2.5-350M-i1-GGUF",
+        "LFM2.5-350M.i1-Q4_K_M.gguf",
+    ),
+    (
+        "Qwen3.5-0.8B.i1-Q4_K_M.gguf",
+        "mradermacher/Qwen3.5-0.8B-i1-GGUF",
+        "Qwen3.5-0.8B.i1-Q4_K_M.gguf",
+    ),
+]
+
 server = ServerPreset.tinyllama2()
 
 
@@ -319,3 +341,100 @@ def test_callback_invocation_and_save():
     assert "KV cache callback invoked" in save_log, f"No callback log: {save_log[:500]}"
     # Check cache was saved
     assert "KV cache saved" in save_log, f"No save log: {save_log[:500]}"
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Multi-model smoke test (mirrors shell lightweight tests)
+# ---------------------------------------------------------------------------
+
+
+def test_multi_model_smoke():
+    """Run lightweight smoke test across multiple models like the shell script."""
+    models = KV_TEST_MODELS[1:]
+    assert len(models) >= 1, "Need at least one secondary model for multi-model test"
+
+    for model_name, hf_repo, hf_file in models:
+        # Download model if not present
+        model_path = download_file(
+            f"https://huggingface.co/{hf_repo}/resolve/main/{hf_file}"
+        )
+        cache_dir = tempfile.mkdtemp(prefix="kv-cache-multi-")
+
+        # Configure server for this model
+        s = ServerProcess()
+        s.debug = True
+        s.n_ctx = 2048
+        s.n_slots = 1
+        s.n_predict = 8
+        s.temperature = 0.0
+        s.model_file = model_path
+        s.offline = True
+        s.kv_cache_auto = True
+        s.kv_cache_dir = cache_dir
+        s.max_cache_size_gb = 1.0
+        s.cache_ttl_seconds = 3600
+        fd, s.log_path = tempfile.mkstemp(suffix=".log")
+        os.close(fd)
+
+        try:
+            s.start()
+            log = LogReader(s.log_path)
+
+            # Init check
+            init_log = log.drain()
+            assert "KV cache auto enabled" in init_log, (
+                f"{model_name}: KV cache auto not enabled"
+            )
+
+            # Request + save
+            res = s.make_request(
+                "POST",
+                "/completion",
+                data={
+                    "prompt": "Tell me a short joke",
+                    "temperature": 0.0,
+                    "top_k": 1,
+                    "n_predict": 8,
+                },
+            )
+            assert res.status_code == 200, f"{model_name}: request failed"
+            time.sleep(3)
+
+            save_log = log.drain()
+            assert "KV cache saved" in save_log, f"{model_name}: no save"
+
+            # Restart + rebuild
+            s.stop()
+            fd, s.log_path = tempfile.mkstemp(suffix=".log")
+            os.close(fd)
+            s.start()
+
+            log = LogReader(s.log_path)
+            init_log = log.drain()
+            assert "KV cache rebuild" in init_log, (
+                f"{model_name}: no rebuild after restart"
+            )
+
+            # Request after restart
+            res2 = s.make_request(
+                "POST",
+                "/completion",
+                data={
+                    "prompt": "Tell me a short joke",
+                    "temperature": 0.0,
+                    "top_k": 1,
+                    "n_predict": 8,
+                },
+            )
+            assert res2.status_code == 200, (
+                f"{model_name}: request after restart failed"
+            )
+
+            hit_log = log.drain()
+            assert "KV cache HIT" in hit_log, f"{model_name}: no HIT after restart"
+
+        finally:
+            s.stop()
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            if os.path.exists(s.log_path):
+                os.unlink(s.log_path)
