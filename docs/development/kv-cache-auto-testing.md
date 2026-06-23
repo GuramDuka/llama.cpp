@@ -51,7 +51,7 @@ pytest unit/test_kv_cache_disk.py -v
 
 ### Shell Smoke Tests (`tests/test-kv-cache-auto.sh`)
 
-End-to-end tests across 3 real models (SmolLM-135M, LFM2.5-350M, Qwen3.5-0.8B). The SmolLM model gets detailed 9-phase tests; the other models get lightweight smoke tests.
+End-to-end tests across 3 real models (SmolLM-135M, LFM2.5-350M, Qwen3.5-0.8B). The SmolLM model gets detailed 9-phase tests; the other models get lightweight smoke tests. 28 assertions total.
 
 Detailed tests (SmolLM):
 1. KV Cache Initialization
