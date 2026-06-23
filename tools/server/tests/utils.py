@@ -105,6 +105,9 @@ class ServerProcess:
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
+    kv_cache_auto: bool | None = None
+    max_cache_size_gb: float | None = None
+    cache_ttl_seconds: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -249,6 +252,12 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.kv_cache_auto is not None:
+            server_args.append("--kv-cache-auto")
+        if self.max_cache_size_gb is not None:
+            server_args.extend(["--max-cache-size-gb", self.max_cache_size_gb])
+        if self.cache_ttl_seconds is not None:
+            server_args.extend(["--cache-ttl", self.cache_ttl_seconds])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:
