@@ -1346,22 +1346,6 @@ common_params_context common_params_parser_init(common_params & params,
                        })
                 .set_env("LLAMA_ARG_CACHE_TTL")
                 .set_examples({ LLAMA_EXAMPLE_SERVER }));
-    add_opt(common_arg({ "--kv-cache-dir" }, "PATH",
-                       string_format("directory for automatic KV cache storage (default: slot-save-path + /kv-meta, "
-                                     "disabled if slot-save-path is empty)",
-                                     params.kv_cache_dir.empty() ? "(auto)" : params.kv_cache_dir.c_str()),
-                       [](common_params & params, const std::string & value) {
-                           params.kv_cache_dir = value;
-                           if (!fs_is_directory(params.kv_cache_dir)) {
-                               throw std::invalid_argument("not a directory: " + value);
-                           }
-                           if (!params.kv_cache_dir.empty() &&
-                               params.kv_cache_dir[params.kv_cache_dir.size() - 1] != DIRECTORY_SEPARATOR) {
-                               params.kv_cache_dir += DIRECTORY_SEPARATOR;
-                           }
-                       })
-                .set_env("LLAMA_ARG_KV_CACHE_DIR")
-                .set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg({ "--context-shift" }, { "--no-context-shift" },
                        string_format("whether to use context shift on infinite text generation (default: %s)",
                                      params.ctx_shift ? "enabled" : "disabled"),

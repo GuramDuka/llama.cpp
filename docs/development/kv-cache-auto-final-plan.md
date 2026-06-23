@@ -22,13 +22,12 @@ The feature is implemented and integrated into `llama-server`. KV cache state is
   - Metrics logging in main loop (lines 3814-3820)
 
 ### CLI parameters
-- `common/common.h` — `kv_cache_auto`, `max_cache_size_gb`, `cache_ttl_seconds`, `kv_cache_dir` (lines 625-628)
-- `common/arg.cpp` — Argument handlers for each parameter (lines 1321-1360)
+- `common/common.h` — `kv_cache_auto`, `max_cache_size_gb`, `cache_ttl_seconds` (lines 625-627)
+- `common/arg.cpp` — Argument handlers for each parameter (lines 1321-1348)
 
 ### Tests
-- `tests/test-kv-cache-disk.cpp` — C++ unit tests (10 tests)
-- `tools/server/tests/unit/test_kv_cache_disk.py` — Python integration tests (9 tests)
-- `tests/test-kv-cache-auto.sh` — Shell smoke tests across 3 models (29 assertions)
+- `tests/test-kv-cache-disk.cpp` — C++ unit tests (13 tests)
+- `tools/server/tests/unit/test_kv_cache_disk.py` — Python integration tests (10 tests)
 
 ---
 
@@ -64,22 +63,15 @@ kv_cache_trie (root)
 ```cpp
 // lines 1288-1355
 if (params_base.kv_cache_auto) {
-    std::string cache_dir;
-
-    if (!params_base.kv_cache_dir.empty()) {
-        cache_dir = params_base.kv_cache_dir;
-    } else if (!params_base.slot_save_path.empty()) {
-        cache_dir = params_base.slot_save_path + "kv-meta";
+    if (params_base.slot_save_path.empty()) {
+        SRV_WRN("KV cache auto enabled but slot-save-path is empty\n");
     } else {
-        SRV_WRN("KV cache auto enabled but no directory configured\n");
-    }
-
-    if (!cache_dir.empty()) {
+        std::string cache_dir = params_base.slot_save_path + "kv-meta";
         std::filesystem::create_directories(cache_dir);
 
         kv_cache_disk_mgr = std::make_unique<kv_cache_disk_manager>();
         if (!kv_cache_disk_mgr->initialize(cache_dir, params_base.max_cache_size_gb,
-                                           params_base.cache_ttl_seconds)) {
+                                            params_base.cache_ttl_seconds)) {
             SRV_WRN("Failed to initialize KV cache disk manager\n");
         } else {
             kv_cache_disk_mgr->set_prompt_similarity_threshold(params_base.slot_prompt_similarity);
@@ -174,7 +166,7 @@ if (params_base.kv_cache_auto && kv_cache_disk_mgr) {
 ## CLI Usage
 
 ```bash
-# Enable with default directory (slot-save-path + "/kv-meta")
+# Enable KV cache auto (requires --slot-save-path)
 ./build/bin/llama-server \
     -m model.gguf \
     --port 8080 \
@@ -182,15 +174,6 @@ if (params_base.kv_cache_auto && kv_cache_disk_mgr) {
     --kv-cache-auto \
     --max-cache-size 2 \
     --cache-ttl 7200
-
-# With custom directory
-./build/bin/llama-server \
-    -m model.gguf \
-    --port 8080 \
-    --kv-cache-auto \
-    --kv-cache-dir /data/kv-cache \
-    --max-cache-size 4 \
-    --cache-ttl 3600
 ```
 
 ---

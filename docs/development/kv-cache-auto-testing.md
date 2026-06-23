@@ -49,27 +49,9 @@ pip install -r requirements.txt
 pytest unit/test_kv_cache_disk.py -v
 ```
 
-### Shell Smoke Tests (`tests/test-kv-cache-auto.sh`)
+### Shell Smoke Tests
 
-End-to-end tests across 3 real models (SmolLM-135M, LFM2.5-350M, Qwen3.5-0.8B). The SmolLM model gets detailed 9-phase tests; the other models get lightweight smoke tests. 28 assertions total.
-
-Detailed tests (SmolLM):
-1. KV Cache Initialization
-2. First Request — Save KV Cache
-3. Disk LCP > RAM LCP (disk wins after restart)
-4. RAM LCP > Disk LCP (RAM wins, skip disk restore)
-5. Both caches empty (LRU fallback)
-6. Disk MISS, RAM has partial match
-7. Trie Rebuild from Disk + HIT
-8. TTL Eviction
-9. Callback Invocation and Save
-
-Lightweight tests (LFM2.5, Qwen3.5): init, request, save, restart+rebuild, request after restart, HIT after restart.
-
-Run:
-```bash
-bash tests/test-kv-cache-auto.sh
-```
+The shell smoke tests have been replaced by the Python integration tests above. All scenarios are covered in Python and C++.
 
 ---
 
@@ -81,10 +63,10 @@ bash tests/test-kv-cache-auto.sh
 build/bin/llama-server \
     --model path/to/model.gguf \
     --port 8080 \
+    --slot-save-path /tmp/kv-cache-test/ \
     --kv-cache-auto \
     --max-cache-size 1 \
     --cache-ttl 3600 \
-    --kv-cache-dir /tmp/kv-cache-test \
     -lv 4
 ```
 
@@ -92,7 +74,7 @@ build/bin/llama-server \
 
 Check server logs for:
 ```
-KV cache auto enabled: dir='/tmp/kv-cache-test', max=1.0 GB, ttl=3600 s, sim_threshold=...
+KV cache auto enabled: dir='/tmp/kv-cache-test/kv-meta', max=1.0 GB, ttl=3600 s, sim_threshold=...
 KV cache disk manager initialized: dir='...', max_size=... GB, ttl=... s, entries=...
 ```
 
@@ -131,7 +113,7 @@ RAM cache preferred (ram LCP=... >= disk LCP=..., skip disk restore)
 ### 5. Verify Cache Files
 
 ```bash
-ls -la /tmp/kv-cache-test/
+ls -la /tmp/kv-cache-test/kv-meta/
 ```
 
 Expected: one or more `slot_*.bin` files.
@@ -185,7 +167,7 @@ grep "evict" /tmp/server.log
 - [ ] Orphaned file reconciliation works on startup
 - [ ] C++ unit tests pass (`ctest -R kv-cache-disk`)
 - [ ] Python integration tests pass (`pytest unit/test_kv_cache_disk.py`)
-- [ ] Shell smoke tests pass (`bash tests/test-kv-cache-auto.sh`)
+- [ ] Python integration tests pass (`pytest unit/test_kv_cache_disk.py`)
 
 ---
 
@@ -193,7 +175,7 @@ grep "evict" /tmp/server.log
 
 ### Issue: "KV cache auto enabled but no directory configured"
 
-**Solution**: Ensure `--slot-save-path` is set, or use `--kv-cache-dir` explicitly.
+**Solution**: Ensure `--slot-save-path` is set.
 
 ### Issue: "Failed to restore KV state for slot X"
 

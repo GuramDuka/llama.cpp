@@ -30,6 +30,11 @@ KV_TEST_MODELS = [
 server = ServerPreset.tinyllama2()
 
 
+def _cache_dir(slot_save_path):
+    """Derive the KV cache directory from slot-save-path."""
+    return slot_save_path + "kv-meta"
+
+
 class LogReader:
     """Tails a log file from a given position."""
 
@@ -56,14 +61,14 @@ def create_server():
     server.temperature = 0.0
     server.cache_ram = 100
     server.kv_cache_auto = True
-    server.kv_cache_dir = tempfile.mkdtemp(prefix="kv-cache-test-")
+    server.slot_save_path = tempfile.mkdtemp(prefix="kv-cache-test-")
     server.max_cache_size_gb = 1.0
     server.cache_ttl_seconds = 3600
     fd, server.log_path = tempfile.mkstemp(suffix=".log")
     os.close(fd)
     yield
     try:
-        shutil.rmtree(server.kv_cache_dir, ignore_errors=True)
+        shutil.rmtree(server.slot_save_path, ignore_errors=True)
     except Exception:
         pass
     # Clean up log file
@@ -115,7 +120,8 @@ def test_kv_cache_initialization():
     assert "KV cache disk manager initialized" in init_log, (
         f"Disk manager not initialized: {init_log[:500]}"
     )
-    assert os.path.isdir(server.kv_cache_dir), "Cache directory does not exist"
+    cache_dir = _cache_dir(server.slot_save_path)
+    assert os.path.isdir(cache_dir), "Cache directory does not exist"
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +147,7 @@ def test_first_request_save():
     assert "KV cache saved" in save_log, f"No save log: {save_log[:500]}"
 
     # Check cache files exist
-    cache_files = list(os.listdir(server.kv_cache_dir))
+    cache_files = list(os.listdir(_cache_dir(server.slot_save_path)))
     assert len(cache_files) > 0, "No cache files created"
 
 
@@ -216,8 +222,9 @@ def test_both_caches_empty_lru_fallback():
     global server
 
     # Clear cache dir so disk has nothing
-    shutil.rmtree(server.kv_cache_dir, ignore_errors=True)
-    os.makedirs(server.kv_cache_dir, exist_ok=True)
+    cache_dir = _cache_dir(server.slot_save_path)
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    os.makedirs(cache_dir, exist_ok=True)
 
     server.start()
     log = LogReader(server.log_path)
@@ -268,7 +275,9 @@ def test_trie_rebuild_from_disk():
     time.sleep(3)
 
     # Check files exist before restart
-    assert len(os.listdir(server.kv_cache_dir)) > 0, "No cache files before restart"
+    assert len(os.listdir(_cache_dir(server.slot_save_path))) > 0, (
+        "No cache files before restart"
+    )
 
     # Restart
     _restart_server()
@@ -280,7 +289,7 @@ def test_trie_rebuild_from_disk():
     assert "KV cache rebuild" in init_log, f"No rebuild log: {init_log[:500]}"
 
     # Files survived restart
-    assert len(os.listdir(server.kv_cache_dir)) > 0, (
+    assert len(os.listdir(_cache_dir(server.slot_save_path))) > 0, (
         "Cache files disappeared after restart"
     )
 
@@ -372,7 +381,7 @@ def test_multi_model_smoke():
         s.model_hf_file = None
         s.offline = True
         s.kv_cache_auto = True
-        s.kv_cache_dir = cache_dir
+        s.slot_save_path = cache_dir
         s.max_cache_size_gb = 1.0
         s.cache_ttl_seconds = 3600
         fd, s.log_path = tempfile.mkstemp(suffix=".log")
