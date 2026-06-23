@@ -36,7 +36,7 @@ std::unique_ptr<kv_cache_disk_manager> kv_cache_disk_mgr;
 
 Location: `server_context_impl::load_model()`, lines 1288-1355.
 
-The cache directory is derived from `--slot-save-path + "kv-meta"`. If `--slot-save-path` is empty, the feature is disabled with a warning.
+The cache directory is `--slot-save-path`. If it is empty, the feature is disabled with a warning.
 
 After initialization, the prompt similarity threshold is set from `--slot-prompt-similarity` and a save callback is installed per slot.
 
@@ -154,7 +154,7 @@ grep "KV cache HIT\|KV cache MISS\|restored slot from disk" server.log
 
 ```
 if (--slot-save-path is set)
-    use --slot-save-path + "kv-meta"
+    use --slot-save-path
 else
     disable auto-save (warning logged)
 ```

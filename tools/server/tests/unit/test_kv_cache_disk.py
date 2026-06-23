@@ -32,9 +32,7 @@ server = ServerPreset.tinyllama2()
 
 def _cache_dir(slot_save_path):
     """Derive the KV cache directory from slot-save-path."""
-    if not slot_save_path.endswith("/"):
-        slot_save_path += "/"
-    return slot_save_path + "kv-meta"
+    return slot_save_path
 
 
 class LogReader:

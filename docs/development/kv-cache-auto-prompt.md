@@ -123,7 +123,7 @@ A callback (`slot.callback_save_kv_cache_to_disk`) is installed per slot. On inv
 | `--max-cache-size <gb>`      | float    | 8.0     | Maximum total cache size in GB            |
 | `--cache-ttl <seconds>`      | int64_t  | 3600    | TTL for cache entries (0 = disabled)      |
 
-The cache directory is derived from `--slot-save-path + "kv-meta"`. The `--slot-save-path` parameter is required for this feature to work.
+The cache directory is `--slot-save-path`. The `--slot-save-path` parameter is required for this feature to work.
 
 ## File Format
 

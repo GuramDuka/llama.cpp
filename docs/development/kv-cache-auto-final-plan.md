@@ -66,7 +66,7 @@ if (params_base.kv_cache_auto) {
     if (params_base.slot_save_path.empty()) {
         SRV_WRN("KV cache auto enabled but slot-save-path is empty\n");
     } else {
-        std::string cache_dir = params_base.slot_save_path + "kv-meta";
+        std::string cache_dir = params_base.slot_save_path;
         std::filesystem::create_directories(cache_dir);
 
         kv_cache_disk_mgr = std::make_unique<kv_cache_disk_manager>();
