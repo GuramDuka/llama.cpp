@@ -259,6 +259,10 @@ set_tests_properties(test-recurrent-state-rollback PROPERTIES FIXTURES_REQUIRED 
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Test KV cache disk save/restore (llama_state_seq_save_file / llama_state_seq_load_file)
+llama_build_and_test(test-kv-cache-disk.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
+set_tests_properties(test-kv-cache-disk PROPERTIES FIXTURES_REQUIRED test-download-model)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)

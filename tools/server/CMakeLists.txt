@@ -15,6 +15,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    kv-cache-disk-manager.cpp
+    kv-cache-disk-manager.h
     server-tools.cpp
     server-tools.h
     server-schema.cpp

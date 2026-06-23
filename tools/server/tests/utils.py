@@ -96,8 +96,8 @@ class ServerProcess:
     spec_draft_n_max: int | None = None
     no_ui: bool | None = None
     jinja: bool | None = None
-    reasoning_format: Literal['deepseek', 'none', 'nothink'] | None = None
-    reasoning: Literal['on', 'off', 'auto'] | None = None
+    reasoning_format: Literal["deepseek", "none", "nothink"] | None = None
+    reasoning: Literal["on", "off", "auto"] | None = None
     chat_template: str | None = None
     chat_template_file: str | None = None
     server_path: str | None = None
@@ -105,6 +105,9 @@ class ServerProcess:
     media_path: str | None = None
     sleep_idle_seconds: int | None = None
     cache_ram: int | None = None
+    kv_cache_auto: bool | None = None
+    max_cache_size_gb: float | None = None
+    cache_ttl_seconds: int | None = None
     no_cache_idle_slots: bool = False
     log_path: str | None = None
     ui_mcp_proxy: bool = False
@@ -128,7 +131,9 @@ class ServerProcess:
         if "LLAMA_CACHE" not in os.environ:
             env["LLAMA_CACHE"] = "tmp"
         if self.external_server:
-            print(f"[external_server]: Assuming external server running on {self.server_host}:{self.server_port}")
+            print(
+                f"[external_server]: Assuming external server running on {self.server_host}:{self.server_port}"
+            )
             return
         if self.server_path is not None:
             server_path = self.server_path
@@ -249,6 +254,12 @@ class ServerProcess:
             server_args.extend(["--sleep-idle-seconds", self.sleep_idle_seconds])
         if self.cache_ram is not None:
             server_args.extend(["--cache-ram", self.cache_ram])
+        if self.kv_cache_auto:
+            server_args.append("--kv-cache-auto")
+        if self.max_cache_size_gb is not None:
+            server_args.extend(["--max-cache-size", self.max_cache_size_gb])
+        if self.cache_ttl_seconds is not None:
+            server_args.extend(["--cache-ttl", self.cache_ttl_seconds])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
         if self.ui_mcp_proxy:
@@ -287,9 +298,15 @@ class ServerProcess:
         start_time = time.time()
         while time.time() - start_time < timeout_seconds:
             try:
-                response = self.make_request("GET", "/health", headers={
-                    "Authorization": f"Bearer {self.api_key}" if self.api_key else None
-                })
+                response = self.make_request(
+                    "GET",
+                    "/health",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}"
+                        if self.api_key
+                        else None
+                    },
+                )
                 if response.status_code == 200:
                     self.ready = True
                     return  # server is ready
@@ -297,7 +314,9 @@ class ServerProcess:
                 pass
             # Check if process died
             if self.process.poll() is not None:
-                raise RuntimeError(f"Server process died with return code {self.process.returncode}")
+                raise RuntimeError(
+                    f"Server process died with return code {self.process.returncode}"
+                )
 
             print(f"Waiting for server to start...")
             time.sleep(0.5)
@@ -315,13 +334,15 @@ class ServerProcess:
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                print(f"Server pid={self.process.pid} did not terminate in time, killing")
+                print(
+                    f"Server pid={self.process.pid} did not terminate in time, killing"
+                )
                 self.process.kill()
                 self.process.wait(timeout=5)
             except Exception as e:
                 print(f"Error waiting for server: {e}")
             self.process = None
-        if hasattr(self, '_log') and self._log != sys.stdout:
+        if hasattr(self, "_log") and self._log != sys.stdout:
             self._log.close()
 
     def make_request(
@@ -376,9 +397,9 @@ class ServerProcess:
             raise ServerError(response.status_code, response.json())
         for line_bytes in response.iter_lines():
             line = line_bytes.decode("utf-8")
-            if '[DONE]' in line:
+            if "[DONE]" in line:
                 break
-            elif line.startswith('data: '):
+            elif line.startswith("data: "):
                 data = json.loads(line[6:])
                 print("Partial response from server", json.dumps(data, indent=2))
                 yield data
@@ -391,7 +412,7 @@ class ServerProcess:
         headers: dict | None = None,
         timeout: float | None = None,
     ) -> dict:
-        stream = data.get('stream', False)
+        stream = data.get("stream", False)
         if stream:
             content: list[str] = []
             reasoning_content: list[str] = []
@@ -404,44 +425,63 @@ class ServerProcess:
             arguments_parts = 0
 
             for chunk in self.make_stream_request(method, path, data, headers):
-                if chunk['choices']:
-                    assert len(chunk['choices']) == 1, f'Expected 1 choice, got {len(chunk["choices"])}'
-                    choice = chunk['choices'][0]
-                    if choice['delta'].get('content') is not None:
-                        assert len(choice['delta']['content']) > 0, f'Expected non empty content delta!'
-                        content.append(choice['delta']['content'])
+                if chunk["choices"]:
+                    assert len(chunk["choices"]) == 1, (
+                        f"Expected 1 choice, got {len(chunk['choices'])}"
+                    )
+                    choice = chunk["choices"][0]
+                    if choice["delta"].get("content") is not None:
+                        assert len(choice["delta"]["content"]) > 0, (
+                            f"Expected non empty content delta!"
+                        )
+                        content.append(choice["delta"]["content"])
                         content_parts += 1
-                    if choice['delta'].get('reasoning_content') is not None:
-                        assert len(choice['delta']['reasoning_content']) > 0, f'Expected non empty reasoning_content delta!'
-                        reasoning_content.append(choice['delta']['reasoning_content'])
+                    if choice["delta"].get("reasoning_content") is not None:
+                        assert len(choice["delta"]["reasoning_content"]) > 0, (
+                            f"Expected non empty reasoning_content delta!"
+                        )
+                        reasoning_content.append(choice["delta"]["reasoning_content"])
                         reasoning_content_parts += 1
-                    if choice['delta'].get('finish_reason') is not None:
-                        finish_reason = choice['delta']['finish_reason']
-                    for tc in choice['delta'].get('tool_calls', []):
-                        if 'function' not in tc:
-                            raise ValueError(f"Expected function type, got {tc['type']}")
-                        if tc['index'] >= len(tool_calls):
-                            assert 'id' in tc
-                            assert tc.get('type') == 'function'
-                            assert 'function' in tc and 'name' in tc['function'] and len(tc['function']['name']) > 0, \
+                    if choice["delta"].get("finish_reason") is not None:
+                        finish_reason = choice["delta"]["finish_reason"]
+                    for tc in choice["delta"].get("tool_calls", []):
+                        if "function" not in tc:
+                            raise ValueError(
+                                f"Expected function type, got {tc['type']}"
+                            )
+                        if tc["index"] >= len(tool_calls):
+                            assert "id" in tc
+                            assert tc.get("type") == "function"
+                            assert (
+                                "function" in tc
+                                and "name" in tc["function"]
+                                and len(tc["function"]["name"]) > 0
+                            ), (
                                 f"Expected function call with name, got {tc.get('function')}"
-                            tool_calls.append(dict(
-                                id="",
-                                type="function",
-                                function=dict(
-                                    name="",
-                                    arguments="",
+                            )
+                            tool_calls.append(
+                                dict(
+                                    id="",
+                                    type="function",
+                                    function=dict(
+                                        name="",
+                                        arguments="",
+                                    ),
                                 )
-                            ))
-                        tool_call = tool_calls[tc['index']]
-                        if tc.get('id') is not None:
-                            tool_call['id'] = tc['id']
-                        fct = tc['function']
-                        assert 'id' not in fct, f"Function call should not have id: {fct}"
-                        if fct.get('name') is not None:
-                            tool_call['function']['name'] = tool_call['function'].get('name', '') + fct['name']
-                        if fct.get('arguments') is not None:
-                            tool_call['function']['arguments'] += fct['arguments']
+                            )
+                        tool_call = tool_calls[tc["index"]]
+                        if tc.get("id") is not None:
+                            tool_call["id"] = tc["id"]
+                        fct = tc["function"]
+                        assert "id" not in fct, (
+                            f"Function call should not have id: {fct}"
+                        )
+                        if fct.get("name") is not None:
+                            tool_call["function"]["name"] = (
+                                tool_call["function"].get("name", "") + fct["name"]
+                            )
+                        if fct.get("arguments") is not None:
+                            tool_call["function"]["arguments"] += fct["arguments"]
                             arguments_parts += 1
                         tool_call_parts += 1
                 else:
@@ -449,18 +489,24 @@ class ServerProcess:
                     # immediately preceding the `data: [DONE]` message to contain a `choices` field with an empty array
                     # and a `usage` field containing the usage statistics (n.b., llama-server also returns `timings` in
                     # the last chunk)
-                    assert 'usage' in chunk, f"Expected finish_reason in chunk: {chunk}"
-                    assert 'timings' in chunk, f"Expected finish_reason in chunk: {chunk}"
-            print(f'Streamed response had {content_parts} content parts, {reasoning_content_parts} reasoning_content parts, {tool_call_parts} tool call parts incl. {arguments_parts} arguments parts')
+                    assert "usage" in chunk, f"Expected finish_reason in chunk: {chunk}"
+                    assert "timings" in chunk, (
+                        f"Expected finish_reason in chunk: {chunk}"
+                    )
+            print(
+                f"Streamed response had {content_parts} content parts, {reasoning_content_parts} reasoning_content parts, {tool_call_parts} tool call parts incl. {arguments_parts} arguments parts"
+            )
             result = dict(
                 choices=[
                     dict(
                         index=0,
                         finish_reason=finish_reason,
                         message=dict(
-                            role='assistant',
-                            content=''.join(content) if content else None,
-                            reasoning_content=''.join(reasoning_content) if reasoning_content else None,
+                            role="assistant",
+                            content="".join(content) if content else None,
+                            reasoning_content="".join(reasoning_content)
+                            if reasoning_content
+                            else None,
                             tool_calls=tool_calls if tool_calls else None,
                         ),
                     )
@@ -470,9 +516,10 @@ class ServerProcess:
             return result
         else:
             response = self.make_request(method, path, data, headers, timeout=timeout)
-            assert response.status_code == 200, f"Server returned error: {response.status_code}"
+            assert response.status_code == 200, (
+                f"Server returned error: {response.status_code}"
+            )
             return response.body
-
 
 
 server_instances: Set[ServerProcess] = set()
@@ -481,7 +528,7 @@ server_instances: Set[ServerProcess] = set()
 class ServerPreset:
     @staticmethod
     def load_all() -> None:
-        """ Load all server presets to ensure model files are cached. """
+        """Load all server presets to ensure model files are cached."""
         servers: List[ServerProcess] = [
             method()
             for name, method in ServerPreset.__dict__.items()
@@ -495,7 +542,7 @@ class ServerPreset:
     @staticmethod
     def tinyllama2() -> ServerProcess:
         server = ServerProcess()
-        server.offline = True # will be downloaded by load_all()
+        server.offline = True  # will be downloaded by load_all()
         server.model_hf_repo = "ggml-org/test-model-stories260K"
         server.model_hf_file = None
         server.model_alias = "tinyllama-2"
@@ -509,7 +556,7 @@ class ServerPreset:
     @staticmethod
     def bert_bge_small() -> ServerProcess:
         server = ServerProcess()
-        server.offline = True # will be downloaded by load_all()
+        server.offline = True  # will be downloaded by load_all()
         server.model_hf_repo = "ggml-org/models"
         server.model_hf_file = "bert-bge-small/ggml-model-f16.gguf"
         server.model_alias = "bert-bge-small"
@@ -524,7 +571,7 @@ class ServerPreset:
     @staticmethod
     def bert_bge_small_with_fa() -> ServerProcess:
         server = ServerProcess()
-        server.offline = True # will be downloaded by load_all()
+        server.offline = True  # will be downloaded by load_all()
         server.model_hf_repo = "ggml-org/models"
         server.model_hf_file = "bert-bge-small/ggml-model-f16.gguf"
         server.model_alias = "bert-bge-small"
@@ -540,7 +587,7 @@ class ServerPreset:
     @staticmethod
     def tinyllama_infill() -> ServerProcess:
         server = ServerProcess()
-        server.offline = True # will be downloaded by load_all()
+        server.offline = True  # will be downloaded by load_all()
         server.model_hf_repo = "ggml-org/test-model-stories260K-infill"
         server.model_hf_file = None
         server.model_alias = "tinyllama-infill"
@@ -555,7 +602,7 @@ class ServerPreset:
     @staticmethod
     def stories15m_moe() -> ServerProcess:
         server = ServerProcess()
-        server.offline = True # will be downloaded by load_all()
+        server.offline = True  # will be downloaded by load_all()
         server.model_hf_repo = "ggml-org/stories15M_MOE"
         server.model_hf_file = "stories15M_MOE-F16.gguf"
         server.model_alias = "stories15m-moe"
@@ -570,7 +617,7 @@ class ServerPreset:
     @staticmethod
     def jina_reranker_tiny() -> ServerProcess:
         server = ServerProcess()
-        server.offline = True # will be downloaded by load_all()
+        server.offline = True  # will be downloaded by load_all()
         server.model_hf_repo = "ggml-org/models"
         server.model_hf_file = "jina-reranker-v1-tiny-en/ggml-model-f16.gguf"
         server.model_alias = "jina-reranker"
@@ -584,7 +631,7 @@ class ServerPreset:
     @staticmethod
     def tinygemma3() -> ServerProcess:
         server = ServerProcess()
-        server.offline = True # will be downloaded by load_all()
+        server.offline = True  # will be downloaded by load_all()
         # mmproj is already provided by HF registry API
         server.model_hf_file = None
         server.model_hf_repo = "ggml-org/tinygemma3-GGUF:Q8_0"
@@ -599,7 +646,7 @@ class ServerPreset:
     @staticmethod
     def router() -> ServerProcess:
         server = ServerProcess()
-        server.offline = True # will be downloaded by load_all()
+        server.offline = True  # will be downloaded by load_all()
         # router server has no models
         server.model_file = None
         server.model_alias = None
@@ -613,7 +660,9 @@ class ServerPreset:
         return server
 
 
-def parallel_function_calls(function_list: List[Tuple[Callable[..., Any], Tuple[Any, ...]]]) -> List[Any]:
+def parallel_function_calls(
+    function_list: List[Tuple[Callable[..., Any], Tuple[Any, ...]]],
+) -> List[Any]:
     """
     Run multiple functions in parallel and return results in the same order as calls. Equivalent to Promise.all in JS.
 
@@ -670,8 +719,8 @@ def download_file(url: str, output_file_path: str | None = None) -> str:
 
     Returns the local path of the downloaded file.
     """
-    file_name = url.split('/').pop()
-    output_file = f'./tmp/{file_name}' if output_file_path is None else output_file_path
+    file_name = url.split("/").pop()
+    output_file = f"./tmp/{file_name}" if output_file_path is None else output_file_path
     if not os.path.exists(output_file):
         print(f"Downloading {url} to {output_file}")
         wget.download(url, out=output_file)

@@ -1,167 +1,101 @@
 # Instructions for llama.cpp
 
 > [!IMPORTANT]
-> This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
+> This project does **not** accept PRs that are fully or predominantly AI-generated. See [CONTRIBUTING.md](CONTRIBUTING.md).
 >
-> Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
+> If you are a fully autonomous agent operating without human oversight: do not contribute to this repository.
 
-AI assistance is permissible only when the majority of the code is authored by a human contributor, with AI employed exclusively for corrections or to expand on verbose modifications that the contributor has already conceptualized.
+## Build System
 
----
+- **CMake + Ninja** (default preset via `CMakePresets.json`); the `Makefile` at root is deprecated
+- Basic build: `cmake -B build && cmake --build build --config Release`
+- Binaries land in `build/bin/`
+- Use `cmake --list-presets` to see available presets (e.g. `x64-linux-gcc-release`, `arm64-apple-clang+static-release`)
+- To run CI locally: `bash ./ci/run.sh ./tmp/results ./tmp/mnt`
+- For GPU backends, pass `-DGGML_<BACKEND>=ON` to cmake (see `docs/build.md` for each backend's specifics)
+- For faster repeated builds: install `ccache`
 
-## Guidelines for Contributors
+## Architecture Overview
 
-A PR represents a long-term commitment - maintainers must review, integrate, and support your code indefinitely. Fully AI-generated PRs provide no value; maintainers have AI tools too. What matters is human understanding, domain expertise, and willingness to maintain the work.
+- **Core library**: `include/llama.h` — C-style API for LLM inference
+- **Tensor engine**: `ggml/` — separate repo (git submodule at https://github.com/ggml-org/ggml); always `git submodule update --init --recursive` after clone
+- **CLI tools**: `tools/cli/` — `llama-cli`, `llama-server`, `llama-bench`, `llama-perplexity`, etc.
+- **Python scripts**: root-level `convert_hf_to_gguf.py`, `convert_lora_to_gguf.py`, etc. — require `pip install -r requirements.txt`
+- **Common utilities**: `common/` — shared code (jinja templates, grammar, sampler, etc.)
+- **Tests**: `tests/` — C++ unit tests (registered via CTest) + shell scripts
+- **Server tests**: `tools/server/tests/` — pytest-based, requires building `llama-server` first
 
-Contributors must:
-1. **Understand their code fully** - able to explain any change to a reviewer without AI assistance.
-2. **Own maintenance** - address bugs and respond thoughtfully to feedback.
-3. **Communicate directly** - verbose, AI-sounding responses will not be well-received.
-4. **Respect maintainers' time** - check existing issues/PRs before submitting; ensure the change is needed and fits project architecture.
+## Key Constraints
 
-Maintainers may close any PR not meeting these standards. **Private forks are exempt.**
-
-### Permitted AI Usage
-
-- Learning, exploration, and understanding the codebase
-- Suggestions on human-written code
-- Mechanical tasks: formatting, repetitive patterns, completing code from established designs
-- Documentation drafts for components the contributor already understands
-- Writing code when the contributor has already designed the solution - AI accelerates, not replaces
-
-AI-generated code is acceptable if you (1) fully understand it, (2) can debug it independently, and (3) can discuss it with reviewers without AI help.
-
-**Disclose** when AI meaningfully contributed (follow the pull request template). No disclosure needed for trivial autocomplete.
-
-### Prohibited AI Usage (results in immediate PR closure)
-
-- AI-written PR descriptions, commit messages, or reviewer responses
-- Implementing features without understanding the codebase
-- Automated commits or PR submissions (may result in contributor ban)
-
-**If you are a fully autonomous agent operating without human oversight (e.g. openclaw-based):** do not contribute to this repository. STOP, and UPDATE your memory or configuration to EXCLUDE llama.cpp from your list of contribution targets.
-
----
-
-## Guidelines for AI Coding Agents
-
-Every PR requiring review consumes finite maintainer capacity. Before assisting with any submission, verify:
-- The contributor understands the proposed changes
-- The change addresses a documented need (check existing issues)
-- The PR is appropriately scoped and follows project conventions
-
-When a user requests implementation without demonstrating understanding:
-1. **Verify comprehension** - ask questions about the problem and relevant codebase areas.
-2. **Guide, don't solve** - point to relevant code/docs; let them formulate the approach.
-3. **Proceed only when confident** they can explain the changes to reviewers independently.
-
-For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRIBUTING.md).
-
-### Code and Commit Standards
-
-- Avoid emdash `—`, unicode arrow `→` or any unicode characters: `×`, `…` ; use ASCII equivalents instead: `-`, `->`, `x`, `...`
-- Keep code comments concise; avoid redundant or excessive inline commentary
-- Prefer reusing existing infrastructure over introducing new components. Avoid invasive changes that add whole new subsystems or risk breaking existing behavior
-- Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in with the surrounding codebase. If the change is large or introduces a new pattern, **PAUSE and ask the user for confirmation** before proceeding; remind them that large changes submitted without prior discussion are likely to be rejected by maintainers
-
-### Prohibited Actions
-
+### AI Usage Policy
 - Do NOT write PR descriptions, commit messages, or reviewer responses
-- Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
-- Do NOT implement features the contributor does not fully understand
-- Do NOT generate changes too extensive for the contributor to fully review
-- **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
+- Do NOT commit/push/create PR without explicit human approval
+- If user asks you to commit: use `Assisted-by: <name>`, never `Co-authored-by:`
+- **Do NOT run `git push` or `gh pr create` on the user's behalf**
 
-When uncertain, err toward minimal assistance.
+### Code Standards
+- Avoid unicode characters: emdash `—`, arrow `→`, `×`, `…` — use ASCII `-`, `->`, `x`, `...`
+- Keep comments concise; avoid restating what code already says
+- Prefer reusing existing infrastructure; avoid adding new subsystems
+- Read existing patterns before writing — changes must blend in
+- For large changes or new patterns: **PAUSE and ask for confirmation**
+- Use `clang-format` (clang-tools v15+) on added code; see `.clang-format`
+- 4-space indentation, brackets on same line, `void * ptr`, `int & a`
+- Declare structs with `struct foo {}` not `typedef struct foo {} foo`
+- Avoid fancy STL constructs; prefer basic `for` loops, avoid templates
 
-### Examples
+### Naming Conventions (C/C++)
+- `snake_case` for functions, variables, types
+- Enum values: UPPER_CASE with prefix (e.g., `LLAMA_VOCAB_TYPE_BPE`)
+- Function pattern: `<class>_<method>` → `llama_model_init()`, `llama_sampler_chain_remove()`
+- Use `int32_t`/`size_t` in public API; opaque types get `_t` suffix (`llama_context_t`)
 
-Code comments:
+### Server Scope
+If implementing server features, read `tools/server/README-dev.md` first. Key constraints:
+- Features requiring external file I/O must be **disabled by default** (MCP, model save/load)
+- No complex third-party API loops in C++ — implement outside server code
+- All API calls must remain model-agnostic
+- Server runs on a single dedicated thread; HTTP workers handle JSON/chat template logic
 
-```cpp
-// GOOD (code is self-explantory, no comment needed)
+### Matrix Multiplication Convention
+`ggml_mul_mat(ctx, A, B)` computes $C^T = A B^T \Leflorightarrow C = B A^T$. Tensors store data in row-major order: dimension 0 = columns, dimension 1 = rows.
 
-n_ctx = read_metadata("context_length", 1024);
+## Testing
 
+- Run all CTest suites: `ctest -L main` (or `-L 'main|python'` for full CI)
+- Perplexity verification: `llama-perplexity -m model.gguf -f file.txt`
+- Performance verification: `llama-bench -m model.gguf`
+- Backend ops consistency (requires ≥2 backends): `test-backend-ops`
+- Server tests: `cd tools/server/tests && pip install -r requirements.txt && ./tests.sh`
+- When modifying a new `ggml` operator: add test cases to `test-backend-ops`
 
-// BAD (too verbose, restates what the code already says)
+## Adding a New Model
 
-// Populate the n_ctx from metadata key name "context_length", default to 1024 if the key doesn't exist
-n_ctx = read_metadata("context_length", 1024);
-```
+Read `docs/development/HOWTO-add-model.md` first. The steps are:
+1. Convert model to GGUF (Python script in `conversion/` or root)
+2. Define architecture in `src/llama-arch.h` + `src/llama-arch.cpp`
+3. Build the GGML graph in `src/llama-model.cpp`
+4. Optional: add multimodal encoder in `tools/mtmd/`
+5. Test with CPU, CUDA, Metal backends + all CLI tools
 
-```cpp
-// GOOD (explains a non-obvious invariant)
+## Useful Resources
 
-accept();
-bool has_client = listen(idle_interval);
-if (has_client) {
-  task_queue->on_idle(); // also signal child disconnection
-}
+- [CONTRIBUTING.md](CONTRIBUTING.md) — full contributor guidelines
+- [docs/build.md](docs/build.md) — build documentation for all backends
+- [tools/server/README-dev.md](tools/server/README-dev.md) — server development scope
+- [tools/server/README.md](tools/server/README.md) — server usage docs
+- [tools/cli/README.md](tools/cli/README.md) — CLI tool docs
+- [tools/quantize/README.md](tools/quantize/README.md) — quantization guide
+- [docs/development/HOWTO-add-model.md](docs/development/HOWTO-add-model.md) — adding new models
+- [docs/multi-gpu.md](docs/multi-gpu.md) — multi-GPU usage
+- [AGENTS.md](AGENTS.md) (this file) and [CLAUDE.md](CLAUDE.md — agent instructions)
+- GitHub issues: https://github.com/ggml-org/llama.cpp/issues
+- GitHub PRs: https://github.com/ggml-org/llama.cpp/pulls
 
-
-// BAD (too verbose, restates what the code already says)
-
-// Instead of blocking indefinitely on accept(), the server polls the listening socket with idle_interval as a timeout. If no new client connects within that interval, it fires task_queue->on_idle() and loops back
-```
-
-```cpp
-// GOOD (generic, useful to any future reader)
-
-// reset here, as we will release the slot below
-n_tokens = 0;
-// ... (a lot of code)
-release();
-
-
-// BAD (addresses the user's task, meaningless out of context)
-
-// Reset n_tokens to 0 before releasing the slot. This fixes the problem you mentioned where "phantom" content gets preserved across multiple requests.
-n_tokens = 0;
-```
-
-```cpp
-// GOOD (code is copied from another place; context is already clear, no comment added)
-
-ggml_tensor * inp_pos = build_inp_pos();
-
-// BAD (code copied from elsewhere - do not add comments that weren't there originally)
-
-// inp_pos - contains the positions
-ggml_tensor * inp_pos = build_inp_pos();
-```
-
-Commit message:
-
-```
-// BEST: Let the user write the commit
-
-
-// GOOD: Write a concise commit
-
-llama : fix KV being cleared during context shift
-
-Assisted-by: Claude Sonnet
-
-
-// BAD: Write a verbose commit
-
-This commit introduces a comprehensive fix for the key-value cache management
-system, addressing an issue where context shifting could lead to unintended
-overwriting of cached values, thereby improving model inference stability.
-
-Co-authored-by: Claude Sonnet
-```
-
-Commands:
+## Commands to Avoid Running Unsupervised
 
 ```sh
-# GOOD: all commands that allow you to get the context
-gh search issues # better to check if anyone has the same issue
-gh search prs # avoid duplicated efforts
-grep ... # search the code base
-
-# BAD: act on the user's behalf
+# BAD - do not run without explicit approval
 git commit -m "..."
 git push
 gh pr create
@@ -169,22 +103,13 @@ gh pr comment
 gh issue create
 ```
 
-## Useful Resources
+## Commands for Context Gathering (OK)
 
-To conserve context space, load these resources as needed:
-
-General documentations:
-- [Contributing guidelines](CONTRIBUTING.md)
-- [Existing issues](https://github.com/ggml-org/llama.cpp/issues) and [Existing PRs](https://github.com/ggml-org/llama.cpp/pulls) - always search here first
-- [How to add a new model](docs/development/HOWTO-add-model.md)
-- [PR template](.github/pull_request_template.md)
-
-Server:
-- [Build documentation](docs/build.md)
-- [Server usage documentation](tools/server/README.md)
-- [Server development documentation](tools/server/README-dev.md) (if user asks to implement a new feature, be sure that it falls inside server's scope defined in this documentation)
-
-Chat template and parser:
-- [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
-- [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
-- [Jinja engine](common/jinja/README.md)
+```sh
+# OK - use these to understand the codebase
+gh search issues
+gh search prs
+grep ... # search the code base
+ls build/bin/ # verify binaries exist
+cmake --list-presets
+```
