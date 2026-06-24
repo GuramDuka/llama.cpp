@@ -1,4 +1,4 @@
-# llama.cpp (GuramDuka fork)
+# llama.cpp
 
 **Fork features added on top of upstream:**
 
