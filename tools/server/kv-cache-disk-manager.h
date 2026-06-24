@@ -18,7 +18,7 @@ struct llama_context;
 struct server_tokens;
 
 // Maximum tokens stored per cache entry (for LCP matching)
-#define KV_CACHE_MAX_TOKENS 8192
+#define KV_CACHE_MAX_TOKENS 32768
 
 // Metrics for cache operations tracking
 struct kv_cache_metrics {
