@@ -67,6 +67,11 @@ enum llama_kv_cache_compress_learn_type {
 
 #define LLAMA_STATE_SEQ_VERSION 2
 
+// Version 3: same magic + compressed frame, but dictionary data is embedded after token header
+// (u32 dict_size + u8[dict_size] dict_data) before the zstd frame.
+// Version 3 files can only be loaded by builds with LLAMA_HAS_ZSTD and dict support.
+#define LLAMA_STATE_SEQ_VERSION_DICT 3
+
 #ifdef __cplusplus
 extern "C" {
 #endif

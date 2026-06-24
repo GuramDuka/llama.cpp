@@ -851,7 +851,9 @@ int main(int argc, char ** argv) {
         std::filesystem::remove(cc_path);
     });
 
-    // Test: Dictionary learning levels 0..3 all produce valid compressed files
+    // Test: Dictionary learning levels 0..3 all produce valid compressed files.
+    // For levels>0, verify dict is embedded (version 3, dict_size > 0).
+    // For level 0, verify no dict (version 2).
     t.test("compress_learn_levels", [&](testing & t) {
         struct {
             const char *                            name;
@@ -876,7 +878,8 @@ int main(int argc, char ** argv) {
             for (int i = 0; i < (int) prompt_tok.size(); ++i) {
                 common_batch_add(batch_l, prompt_tok[i], i, { 0 }, true);
             }
-            t.assert_true("decode", llama_decode(ctx_l.get(), batch_l) == 0);
+            t.assert_true(("learn=" + std::string(lv.name) + " decode").c_str(),
+                          llama_decode(ctx_l.get(), batch_l) == 0);
             llama_batch_free(batch_l);
 
             size_t written = llama_state_seq_save_file(ctx_l.get(), filepath, 0, prompt_tok.data(), prompt_tok.size());
@@ -888,6 +891,23 @@ int main(int argc, char ** argv) {
             t.assert_true(("learn=" + std::string(lv.name) + " magic").c_str(),
                           magic == LLAMA_STATE_SEQ_MAGIC_COMPRESSED);
 
+            // Verify version: 2 for NONE, 3 for levels that train a dict
+            if (lv.val == LLAMA_KV_CACHE_COMPRESS_LEARN_NONE) {
+                t.assert_true(("learn=" + std::string(lv.name) + " version 2").c_str(),
+                              version == LLAMA_STATE_SEQ_VERSION);
+            } else {
+                t.assert_true(("learn=" + std::string(lv.name) + " version 3").c_str(),
+                              version == LLAMA_STATE_SEQ_VERSION_DICT);
+                // Read dict_size from file (right after tokens)
+                std::ifstream f(filepath, std::ios::binary);
+                t.assert_true(("learn=" + std::string(lv.name) + " open").c_str(), !!f);
+                // Skip magic(4) + version(4) + n_tok(4) + tokens
+                f.seekg(12 + (std::streamoff) (sizeof(llama_token) * n_tok));
+                uint32_t dict_file_size = 0;
+                f.read(reinterpret_cast<char *>(&dict_file_size), 4);
+                t.assert_true(("learn=" + std::string(lv.name) + " dict_size>0").c_str(), dict_file_size > 0);
+            }
+
             std::vector<int32_t> buf(prompt_tok.size());
             size_t               n_out = 0;
             size_t loaded = llama_state_seq_load_file(ctx_l.get(), filepath, -1, buf.data(), prompt_tok.size(), &n_out);
@@ -896,6 +916,55 @@ int main(int argc, char ** argv) {
 
             std::filesystem::remove(filepath);
         }
+    });
+
+    // Test: Dict is reused on second save (SAMPLE_FIRST trains once, uses same dict for subsequent saves)
+    t.test("compressed_dict_twice", [&](testing & t) {
+        char filepath1[512];
+        char filepath2[512];
+        snprintf(filepath1, sizeof(filepath1), "%s/dict_first.bin", cache_dir);
+        snprintf(filepath2, sizeof(filepath2), "%s/dict_second.bin", cache_dir);
+
+        llama_context_params cp    = llama_context_default_params();
+        cp.n_ctx                   = 256;
+        cp.compress_kv_cache       = 3;
+        cp.compress_kv_cache_learn = LLAMA_KV_CACHE_COMPRESS_LEARN_SAMPLE_FIRST;
+        auto ctx_d                 = llama_context_ptr{ llama_init_from_model(model, cp) };
+
+        llama_batch batch_d = llama_batch_init((int) prompt_tok.size(), 0, 1);
+        for (int i = 0; i < (int) prompt_tok.size(); ++i) {
+            common_batch_add(batch_d, prompt_tok[i], i, { 0 }, true);
+        }
+        t.assert_true("decode", llama_decode(ctx_d.get(), batch_d) == 0);
+        llama_batch_free(batch_d);
+
+        // First save — trains dict
+        size_t w1 = llama_state_seq_save_file(ctx_d.get(), filepath1, 0, prompt_tok.data(), prompt_tok.size());
+        t.assert_true("first save > 0", w1 > 0);
+
+        uint32_t m1 = 0, v1 = 0, n1 = 0;
+        t.assert_true("hdr1", read_header(filepath1, &m1, &v1, &n1));
+        t.assert_true("v1 == dict", v1 == LLAMA_STATE_SEQ_VERSION_DICT);
+
+        // Second save — reuses same dict, no retrain
+        size_t w2 = llama_state_seq_save_file(ctx_d.get(), filepath2, 0, prompt_tok.data(), prompt_tok.size());
+        t.assert_true("second save > 0", w2 > 0);
+
+        uint32_t m2 = 0, v2 = 0, n2 = 0;
+        t.assert_true("hdr2", read_header(filepath2, &m2, &v2, &n2));
+        t.assert_true("v2 == dict", v2 == LLAMA_STATE_SEQ_VERSION_DICT);
+
+        // Both files are loadable
+        for (const auto & fp : { filepath1, filepath2 }) {
+            std::vector<int32_t> buf(prompt_tok.size());
+            size_t               n_out = 0;
+            size_t loaded = llama_state_seq_load_file(ctx_d.get(), fp, -1, buf.data(), prompt_tok.size(), &n_out);
+            t.assert_true("dict two-file restore", loaded > 0);
+            t.assert_true("dict two-file tokens", n_out == prompt_tok.size());
+        }
+
+        std::filesystem::remove(filepath1);
+        std::filesystem::remove(filepath2);
     });
 #endif
 

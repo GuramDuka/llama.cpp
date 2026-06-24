@@ -18,6 +18,9 @@ class llama_batch_allocr;
 
 class llama_io_read_i;
 class llama_io_write_i;
+#ifdef LLAMA_HAS_ZSTD
+class llama_kv_dict;
+#endif
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
@@ -375,4 +378,8 @@ struct llama_context {
     // KV cache compression (zstd)
     int32_t                                 compress_kv_cache       = 0;  // 0 = disabled, -22..22 = zstd level
     enum llama_kv_cache_compress_learn_type compress_kv_cache_learn = LLAMA_KV_CACHE_COMPRESS_LEARN_NONE;
+#ifdef LLAMA_HAS_ZSTD
+    std::unique_ptr<llama_kv_dict> kv_dict;
+    int                            dict_save_counter = 0;
+#endif
 };

@@ -22,6 +22,9 @@
 #    include <zstd.h>
 #    define ZDICT_STATIC_LINKING_ONLY
 #    include <zdict.h>
+// Forward declaration of factory function (defined after llama_kv_dict class)
+class llama_kv_dict;
+static std::unique_ptr<llama_kv_dict> create_kv_dict();
 #endif
 
 //
@@ -104,6 +107,10 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
     if (compress_kv_cache != 0) {
         LLAMA_LOG_INFO("%s: KV cache compression enabled, zstd level=%d, learning=%d\n", __func__, compress_kv_cache,
                        compress_kv_cache_learn);
+    }
+    if (compress_kv_cache != 0 && compress_kv_cache_learn != LLAMA_KV_CACHE_COMPRESS_LEARN_NONE) {
+        kv_dict = create_kv_dict();
+        LLAMA_LOG_INFO("%s: KV cache dictionary learning enabled, mode=%d\n", __func__, compress_kv_cache_learn);
     }
 #endif
 
@@ -2669,6 +2676,33 @@ class llama_io_read_host : public llama_io_read_i {
     std::vector<read_info> rinfos;
 };
 
+// Buffer-backed IO writer for collecting raw KV data as dictionary training samples.
+class llama_io_write_buf : public llama_io_write_i {
+  public:
+    llama_io_write_buf() = default;
+
+    void write(const void * src, size_t size) override {
+        const uint8_t * data = static_cast<const uint8_t *>(src);
+        buf.insert(buf.end(), data, data + size);
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        temp_buffer.resize(size);
+        ggml_backend_tensor_get(tensor, temp_buffer.data(), offset, size);
+        write(temp_buffer.data(), temp_buffer.size());
+    }
+
+    size_t n_bytes() override { return buf.size(); }
+
+    const uint8_t * data() const { return buf.data(); }
+
+    size_t size() const { return buf.size(); }
+
+  private:
+    std::vector<uint8_t> buf;
+    std::vector<uint8_t> temp_buffer;
+};
+
 class llama_io_write_file : public llama_io_write_i {
   public:
     llama_io_write_file(llama_file * f) : file(f) {}
@@ -3377,12 +3411,16 @@ class llama_kv_dict {
     llama_kv_dict()  = default;
     ~llama_kv_dict() = default;
 
-    // Add a sample (raw KV cache data) for dictionary training
+    // Add a sample (raw KV cache data) for dictionary training.
+    // Splits the data into 16 KB chunks so ZDICT fastCover (which needs >=10 samples) works.
     void add_sample(const uint8_t * data, size_t size) {
-        // Store a partial sample to bound memory usage (~10 MB per sample)
-        const size_t max_sample = 10 * 1024 * 1024;
-        size_t       sz         = std::min(size, max_sample);
-        samples.emplace_back(data, data + sz);
+        const size_t chunk_size = 16 * 1024;  // 16 KB per chunk == one "sample" for ZDICT
+        size_t       offset     = 0;
+        while (offset < size) {
+            size_t sz = std::min(chunk_size, size - offset);
+            samples.emplace_back(data + offset, data + offset + sz);
+            offset += sz;
+        }
     }
 
     // Train the dictionary from accumulated samples
@@ -3400,23 +3438,25 @@ class llama_kv_dict {
             sample_sizes.push_back(s.size());
         }
 
-        // Target dictionary size: 112 KB (zstd recommended minimum)
-        const size_t target_dict_size = 112 * 1024;
+        // Target dictionary size: ~5% of total training data, capped at 64 KB.
+        // ZDICT fastCover needs >=10 samples, so add_sample() splits data into 16KB chunks.
+        const size_t target_dict_size =
+            std::min((size_t) (64 * 1024), std::max((size_t) (4 * 1024), all_data.size() / 20));
         dict.resize(target_dict_size);
 
         ZDICT_fastCover_params_t params;
         memset(&params, 0, sizeof(params));
         params.zParams.compressionLevel  = level;
         params.zParams.notificationLevel = 0;  // no stderr output
-        params.k                         = 0;  // auto
-        params.d                         = 8;
-        params.f                         = 20;
+        params.k                         = 128;
+        params.d                         = 6;
+        params.f                         = 15;
         params.steps                     = 1;  // single pass for speed
         params.splitPoint                = 0.0;
         params.accel                     = 2;  // skip every other dmer for 2x speed
 
-        size_t dict_size = ZDICT_optimizeTrainFromBuffer_fastCover(dict.data(), dict.size(), all_data.data(),
-                                                                   sample_sizes.data(), sample_sizes.size(), &params);
+        size_t dict_size = ZDICT_trainFromBuffer_fastCover(dict.data(), dict.size(), all_data.data(),
+                                                           sample_sizes.data(), (unsigned) sample_sizes.size(), params);
 
         if (ZDICT_isError(dict_size)) {
             dict.clear();
@@ -3449,6 +3489,11 @@ class llama_kv_dict {
     bool                              trained = false;
 };
 
+// Factory function for kv_dict — defined after the complete class definition
+static std::unique_ptr<llama_kv_dict> create_kv_dict() {
+    return std::unique_ptr<llama_kv_dict>(new llama_kv_dict());
+}
+
 #endif  // LLAMA_HAS_ZSTD
 
 size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
@@ -3474,7 +3519,7 @@ size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
             return 0;
         }
 
-        if (compressed && version != LLAMA_STATE_SEQ_VERSION) {
+        if (compressed && version != LLAMA_STATE_SEQ_VERSION && version != LLAMA_STATE_SEQ_VERSION_DICT) {
             LLAMA_LOG_ERROR("%s: unknown version for compressed sequence state file: %08x\n", __func__, version);
             return 0;
         }
@@ -3498,15 +3543,24 @@ size_t llama_context::state_seq_load_file(llama_seq_id  seq_id,
     {
         if (compressed) {
 #ifdef LLAMA_HAS_ZSTD
-            llama_io_read_zstd io(&file);
+            // Version 3: read embedded dictionary before the zstd frame
+            size_t               dict_file_size = 0;
+            std::vector<uint8_t> dict_file_data;
+            if (version == LLAMA_STATE_SEQ_VERSION_DICT) {
+                dict_file_size = file.read_u32();
+                if (dict_file_size > 0) {
+                    dict_file_data.resize(dict_file_size);
+                    file.read_raw(dict_file_data.data(), dict_file_size);
+                }
+            }
+            llama_io_read_zstd io(&file, dict_file_data.empty() ? nullptr : dict_file_data.data(),
+                                  dict_file_data.size());
             const size_t       nread = state_seq_read_data(io, seq_id, 0);
             if (!nread) {
                 LLAMA_LOG_ERROR("%s: failed to restore compressed sequence state\n", __func__);
                 return 0;
             }
-            const size_t header_bytes =
-                sizeof(uint32_t) * 2 + sizeof(uint32_t) + sizeof(llama_token) * *n_token_count_out;
-            return header_bytes + nread;
+            return file.tell();
 #else
             LLAMA_LOG_ERROR("%s: compressed KV cache file but zstd not available\n", __func__);
             return 0;
@@ -3535,14 +3589,61 @@ size_t llama_context::state_seq_save_file(llama_seq_id        seq_id,
 
     if (compress_kv_cache != 0) {
 #ifdef LLAMA_HAS_ZSTD
-        // compressed write
+        // compressed write with optional dictionary learning
+        const int level = compress_kv_cache;
+
+        // Determine if we need to sample KV data for dictionary training
+        bool need_sample = false;
+        bool need_train  = false;
+        if (kv_dict) {
+            if (compress_kv_cache_learn == LLAMA_KV_CACHE_COMPRESS_LEARN_SAMPLE_FIRST && !kv_dict->is_trained()) {
+                need_sample = true;
+                need_train  = true;
+            } else if (compress_kv_cache_learn >= LLAMA_KV_CACHE_COMPRESS_LEARN_INCREMENTAL) {
+                need_sample = true;
+                if (!kv_dict->is_trained()) {
+                    need_train = true;
+                } else if (++dict_save_counter % 10 == 0) {
+                    need_train = true;
+                }
+            }
+        }
+
+        // If we need a new sample, serialize uncompressed KV data to a buffer
+        if (need_sample) {
+            llama_io_write_buf buf_io;
+            state_seq_write_data(buf_io, seq_id, 0);
+            if (buf_io.size() > 0) {
+                kv_dict->add_sample(buf_io.data(), buf_io.size());
+            } else {
+                need_train = false;  // nothing to train on
+            }
+        }
+
+        // Train/retrain dictionary if needed
+        if (need_train) {
+            const int train_level = std::max(1, level);
+            kv_dict->train(train_level);
+        }
+
+        const void * dict_data    = (kv_dict && kv_dict->is_trained()) ? kv_dict->data() : nullptr;
+        size_t       dict_size    = (kv_dict && kv_dict->is_trained()) ? kv_dict->size() : 0;
+        uint32_t     file_version = (dict_size > 0) ? LLAMA_STATE_SEQ_VERSION_DICT : LLAMA_STATE_SEQ_VERSION;
+
         file.write_u32(LLAMA_STATE_SEQ_MAGIC_COMPRESSED);
-        file.write_u32(LLAMA_STATE_SEQ_VERSION);
+        file.write_u32(file_version);
 
         file.write_u32((uint32_t) n_token_count);
         file.write_raw(tokens, sizeof(llama_token) * n_token_count);
 
-        llama_io_write_zstd io(&file, compress_kv_cache);
+        if (file_version == LLAMA_STATE_SEQ_VERSION_DICT) {
+            file.write_u32((uint32_t) dict_size);
+            if (dict_size > 0) {
+                file.write_raw(dict_data, dict_size);
+            }
+        }
+
+        llama_io_write_zstd io(&file, level, dict_data, dict_size);
         state_seq_write_data(io, seq_id, 0);
 
         const size_t res = file.tell();
