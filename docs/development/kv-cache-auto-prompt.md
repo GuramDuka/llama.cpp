@@ -1,153 +1,277 @@
-# KV Cache Auto-Save/Restore — Design Specification
+# KV Cache Auto-Save/Restore -- Design Specification
 
 ## Overview
 
-`llama-server` can persist KV cache state to disk so that subsequent requests with the same or similar prompts can restore the cache instead of re-decoding the prompt. The feature is disabled by default and gated behind the `--kv-cache-auto` flag.
+`llama-server` persists KV cache state across a **unified 3-tier hierarchy**: L1 (GPU slots), L2 (RAM prompt cache), and L3 (disk cache). When a request arrives, all matching entries from all three tiers are collected into a single sorted pool. The best candidate is selected by a composite sort (similarity DESC, freshness DESC, tier priority) and promoted according to tier rules.
 
-## Architecture
+Saves to L2 and L3 occur **only on successful completion**; interrupted or cancelled requests skip all persistence.
+
+---
+
+## 3-Tier Architecture
 
 ```
   Request arrives
        |
        v
-  ┌──────────────────────┐
-  │  find_cache_entry()  │  Radix Tree (Trie) pre-filter, LCP similarity filter
-  │  (disk cache lookup) │
-  └────────┬─────────────┘
-           │  cache_file (path, may be empty)
-           v
-  ┌──────────────────────┐
-  │  Compare disk LCP    │  vs best RAM LCP across free slots
-  │  vs RAM LCP          │
-  └────────┬─────────────┘
-           │
-    disk LCP > RAM LCP ?
-           │
-       +---+---+
-      yes     no
-       |       |
-       v       v
-  restore_from_disk()  Continue to RAM-level LCP / LRU selection
-       |
-       v
-  Return restored slot
+  +---------------------------------------------+
+  | Build combined candidate pool               |
+  |                                             |
+  | L1 (slots):   get_common_prefix for idle    |
+  | L2 (RAM):     find_all_matching()           |
+  | L3 (disk):    find_all_matching_entries()   |
+  +---------------------+-----------------------+
+                        |
+                        v
+  +---------------------------------------------+
+  | Sort pool: similarity DESC                  |
+  |            freshness DESC                   |
+  |            tier priority (L1 < L2 < L3)     |
+  +---------------------+-----------------------+
+                        |
+            +-----------+-----------+
+            |                       |
+            v                       v
+       best.tier == L1        best.tier == L2
+       Use slot directly      Load L2 -> L1
+                                  |
+            +-----------------------+-----------------------+
+            |                                               |
+            v                                               v
+       best.tier == L3                                  No candidates
+       Restore L3 -> L1 + promote L3 -> L2              LRU slot
+            |
+            v
+  +---------------------------------------------+
+  | Process request (generate)                  |
+  +---------------------+-----------------------+
+                        |
+            +-----------+-----------+
+            |                       |
+            v                       v
+     completed_successfully     interrupted/error
+            |                       |
+            v                       v
+     Save L1->L2+L3            Skip all saves
+            |
+            v
+       slot.reset()
 ```
+
+---
 
 ## Data Structures
 
-### kv_cache_trie (Radix Tree)
+### cache_candidate (temporary, built per request)
 
-Each node maps a token ID to child nodes. Entry indices (pointing into the LRU ring) are stored at the deepest matching node, enabling fast prefix matching.
+```cpp
+struct cache_candidate {
+    enum tier_t { TIER_L1_SLOT, TIER_L2_RAM, TIER_L3_DISK };
 
-- **Insert**: O(m log k) — m = token sequence length, k = vocabulary size
+    tier_t        tier;         // origin tier
+    float         similarity;   // LCP ratio to request tokens
+    int64_t       freshness;    // timestamp_us for tie-breaking
+    server_slot * slot;         // L1 only
+    std::string   filepath;     // L3 only
+};
+```
+
+### L3 -- kv_cache_trie (Radix Tree)
+
+Each node maps a token ID to child nodes. Entry indices (pointing into the LRU ring) are stored at the deepest matching node, enabling O(m log k) prefix matching.
+
+- **Insert**: O(m log k) -- m = token sequence length, k = vocabulary size
 - **Search**: traverses the trie, collects entry indices from the deepest matching node
 - **Remove**: walks all nodes and removes stale entry indices
 
-### kv_cache_disk_manager
+### L3 -- kv_cache_disk_manager
 
-The central class. Owns:
+Central class for disk cache. Owns:
 
-- `lru_ring_` — ring buffer of `ring_buffer_entry` (metadata + access order)
-- `filepath_index_` — O(1) map from filepath to ring index
-- `trie_` — Radix Tree for prefix matching
-- `metrics_` — `kv_cache_metrics` counters (hits, misses, saves, evictions)
+- `lru_ring_` -- ring buffer of `ring_buffer_entry` (metadata + access order)
+- `filepath_index_` -- O(1) map from filepath to ring index
+- `trie_` -- Radix Tree for prefix matching
+- `metrics_` -- `kv_cache_metrics` counters (hits, misses, saves, evictions)
 
-### disk_cache_entry
-
-Per-entry metadata stored in memory:
+### L3 -- disk_cache_entry
 
 ```cpp
 struct disk_cache_entry {
-    std::string          filepath;          // Path to serialized KV state file
-    int64_t              created_at_us;     // Creation timestamp (microseconds)
-    int64_t              last_accessed_us;  // Last access timestamp
-    size_t               file_size_bytes;   // Size of the cached data
-    uint32_t             seq_id;            // Sequence ID associated with this entry
-    std::vector<int32_t> tokens;            // Token sequence for LCP matching (first N tokens)
+    std::string          filepath;
+    int64_t              created_at_us;
+    int64_t              last_accessed_us;
+    size_t               file_size_bytes;
+    uint32_t             seq_id;
+    std::vector<int32_t> tokens;   // first N tokens for LCP matching
 };
 ```
 
-## Public API
+### L2 -- server_prompt_cache
+
+In-memory ring buffer of `server_prompt` states with:
+
+- `find_all_matching(tokens_new, threshold)` -- returns ALL matching entries
+- `load(prompt, tokens, ctx, slot)` -- restores KV from RAM to GPU
+- `alloc()` -- allocates space for new entry
+- `update()` -- applies pending changes
+
+### L2 -- prompt_cache_match
 
 ```cpp
-class kv_cache_disk_manager {
-  public:
-    bool initialize(const std::string & cache_dir, float max_size_gb, int64_t ttl_seconds);
-    std::string find_cache_entry(const llama_tokens & tokens, float lcp_threshold);
-    bool restore_from_disk(const std::string & filepath, int32_t slot_id, llama_context * ctx_tgt);
-    bool save_to_disk(int32_t slot_id, llama_context * ctx_tgt, llama_context * ctx_dft,
-                      const int32_t * tokens, size_t token_count);
-    float get_disk_lcp(const std::string & filepath, const std::vector<int32_t> & tokens) const;
-    void  set_prompt_similarity_threshold(float threshold);
-    float get_prompt_similarity_threshold() const;
-    kv_cache_metrics get_metrics() const;
-    void  reset_metrics();
-    void  reconcile_orphaned_files();
-    void  purge_all_cache_files();
-    float calculate_lcp_ratio(const std::vector<int32_t> & a, const std::vector<int32_t> & b) const;
-    float calculate_lcp_ratio(const server_tokens & a, const std::vector<int32_t> & b) const;
+struct prompt_cache_match {
+    float   similarity;      // LCP ratio
+    int64_t timestamp_us;    // created_us for freshness
 };
 ```
 
-## Slot Allocation Logic (server-context.cpp)
+### L1 -- server_slot
 
-In `get_available_slot()`:
+Each slot carries:
 
-1. If `--kv-cache-auto` and disk manager is initialized:
-   - Single `find_cache_entry()` search (not per-slot)
-   - Compute `disk_lcp` from the returned filepath
-   - Iterate free slots to find `best_ram_lcp` (common prefix with GPU KV cache)
-   - If `disk_lcp > best_ram_lcp` → `restore_from_disk()` to the first free slot
-   - If `best_ram_lcp > disk_lcp` → log "RAM cache preferred", fall through
-2. Prompt-similarity matching (RAM only)
-3. LRU fallback
+- `prompt.tokens` -- currently loaded prompt (for LCP matching)
+- `task_tokens_original` -- prompt tokens captured at task start (for disk save)
+- `t_last_used` -- last use timestamp (freshness + LRU fallback)
+- `completed_successfully` -- gate for conditional save
+- `callback_save_kv_cache_to_disk` -- L3 save function
+- `callback_save_kv_cache_to_ram` -- L2 save function
 
-## Save Callback
+---
 
-A callback (`slot.callback_save_kv_cache_to_disk`) is installed per slot. On invocation:
+## Pool Building & Sorting
 
-1. Guard: skip if streaming task still active
-2. Prefer `slot.kv_cache_original_tokens` (captured at task start); fall back to `slot.prompt.tokens`; then save with `nullptr/0`
-3. Call `save_to_disk()` which handles eviction, writes the file via `llama_state_seq_save_file()`, and inserts the entry into the LRU ring + trie
+### Candidate Collection (in `get_available_slot()`)
+
+1. **L1**: iterate idle slots, compute `get_common_prefix / task.tokens.size()`, push if above `slot_prompt_similarity`
+2. **L2**: `prompt_cache->find_all_matching(tokens, threshold)` -- linear scan of all cached states
+3. **L3**: `kv_cache_disk_mgr->find_all_matching_entries(tokens, threshold)` -- Radix Tree pre-filter + per-candidate LCP
+
+### Sort Comparator
+
+```cpp
+std::sort(candidates.begin(), candidates.end(),
+    [](const cache_candidate & a, const cache_candidate & b) {
+        if (std::abs(a.similarity - b.similarity) > 1e-6f)
+            return a.similarity > b.similarity;       // 1. highest LCP first
+        if (a.freshness != b.freshness)
+            return a.freshness > b.freshness;          // 2. most recent first
+        return a.tier < b.tier;                         // 3. L1 < L2 < L3
+    });
+```
+
+### Selection Rules
+
+| Best Tier | Action |
+|---|---|
+| **L1** (slot) | Use directly -- KV already in GPU |
+| **L2** (RAM) | `slot.prompt_load(*prompt_cache, tokens)` -- restore from RAM to slot |
+| **L3** (disk) | 1. `kv_cache_disk_mgr->restore_from_disk(filepath, slot.id, ctx)` 2. `slot.prompt_save(*prompt_cache) + prompt_cache->update()` -- promote to L2 |
+| None | LRU fallback (oldest `t_last_used`) |
+
+---
+
+## Conditional Save Protocol
+
+### The `completed_successfully` Gate
+
+A boolean flag on `server_slot` controls all persistence:
+
+- **Set `true`** on: normal generation stop, EOS token, `max_tokens` reached, embedding/rerank completion
+- **Cleared `false`** on: `slot.reset()`, any interrupt, cancel, or error
+- **Checked** in `slot.release()` before calling save callbacks
+
+### Release Flow
+
+```
+slot.release()
+  |
+  +-- completed_successfully == true?
+  |     YES: callback_save_kv_cache_to_disk()  -> L3
+  |          callback_save_kv_cache_to_ram()    -> L2
+  |     NO:  log "skipping cache save"
+  |
+  +-- reset()  (clears completed_successfully = false, tokens, etc.)
+  +-- callback_on_release(id_slot)
+```
+
+### Save Callbacks
+
+Installed per slot during `load_model()`:
+
+**L3 (disk):**
+```cpp
+kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
+                                slot.task_tokens_original.data(),
+                                slot.task_tokens_original.size());
+```
+
+**L2 (RAM):**
+```cpp
+slot.prompt_save(*prompt_cache);
+prompt_cache->update();
+```
+
+Saves happen **before** `reset()`, so `task_tokens_original` and KV state are still valid.
+
+---
 
 ## Eviction
 
-- **TTL**: `evict_expired_entries()` is called before every search and save
-- **LRU**: when `current_size_bytes_` exceeds `max_size_bytes_`, the LRU entry (lowest `access_order`) is evicted
+### L3 (Disk)
+
+- **TTL**: `evict_expired_entries()` called before every search and save
+- **LRU**: when `current_size_bytes_` exceeds `max_size_bytes_`, the entry with lowest `access_order` is evicted
+
+### L2 (RAM)
+
+- **Size limit**: managed by `server_prompt_cache` ring buffer with configurable size (`--cache-ram` MiB limit)
+
+---
 
 ## CLI Parameters
 
-| Flag                         | Type     | Default | Description                               |
-| ---------------------------- | -------- | ------- | ----------------------------------------- |
-| `--kv-cache-auto`            | bool     | false   | Enable automatic KV cache disk management |
-| `--max-cache-size <gb>`      | float    | 8.0     | Maximum total cache size in GB            |
-| `--cache-ttl <seconds>`      | int64_t  | 3600    | TTL for cache entries (0 = disabled)      |
+| Flag | Type | Default | Tiers | Description |
+|---|---|---|---|---|
+| `--kv-cache-auto` | bool | false | L3 | Enable automatic KV cache disk management |
+| `--slot-save-path <dir>` | string | "" | L3 | Cache directory (required for L3) |
+| `--cache-ram <mib>` | int | 0 | L2 | RAM prompt cache size (MiB); 0 = disabled |
+| `--slot-prompt-similarity` | float | varies | L1+L2+L3 | LCP threshold for all 3 tiers |
+| `--max-cache-size <gb>` | float | 8.0 | L3 | Maximum disk cache size in GB (0 = unlimited) |
+| `--cache-ttl <seconds>` | int64 | 3600 | L3 | TTL for disk entries (0 = no expiration) |
 
-The cache directory is `--slot-save-path`. The `--slot-save-path` parameter is required for this feature to work.
+---
 
-## File Format
+## File Format (L3)
 
 Cache files use the `llama_state_seq_save_file` / `llama_state_seq_load_file` format:
 
-- Header: magic (4 bytes, `LLAMA_STATE_SEQ_MAGIC`) + version (4 bytes) + n_token_count (4 bytes)
+- Header: magic (`LLAMA_STATE_SEQ_MAGIC`, 4 bytes) + version (4 bytes) + `n_token_count` (4 bytes)
 - Token data: `n_token_count` int32 values
 - KV cache data: variable length
 
+---
+
 ## Thread Safety
 
-All public methods are guarded by `std::recursive_mutex mutex_`.
+- `kv_cache_disk_manager`: all public methods guarded by `std::recursive_mutex mutex_`
+- `server_prompt_cache`: single-threaded access (server main loop)
+- `server_slot`: owned by main loop, no concurrent access
+
+---
 
 ## Security
 
-1. Feature is **disabled by default** — requires explicit `--kv-cache-auto`
+1. Feature is **disabled by default** -- requires explicit `--kv-cache-auto`
 2. Size limits prevent disk exhaustion with `--max-cache-size`
-3. TTL enforcement automatically cleans up stale entries
-4. Orphaned files are reconciled on startup
-5. All operations are synchronous and bounded
+3. TTL enforcement automatically cleans up stale disk entries
+4. `completed_successfully` gate prevents partial state persistence on interrupts
+5. Orphaned files are reconciled on startup
+6. All operations are synchronous and bounded
+
+---
 
 ## Metrics
 
-Logged periodically (every 300 seconds) and available via `get_metrics()`:
+Logged periodically (every 300 seconds):
 
 - `cache_hits` / `cache_misses`
 - `saves_completed` / `saves_skipped`

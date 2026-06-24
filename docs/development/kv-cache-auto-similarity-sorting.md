@@ -1,8 +1,8 @@
-# KV Cache Auto-Save/Restore — Similarity Sorting and LCP Matching
+# KV Cache Auto-Save/Restore -- Similarity Sorting and LCP Matching
 
 ## Overview
 
-When a request arrives, the KV cache disk manager uses a Radix Tree (Trie) to efficiently find candidate cache entries, then computes the actual LCP (Longest Common Prefix) ratio for each candidate and sorts them by similarity with LRU tie-breaking.
+KV cache matching across all 3 tiers (L1 slots, L2 RAM, L3 disk) uses **Longest Common Prefix (LCP)** ratio as the similarity metric. All matching entries are collected into a single sorted pool and the best candidate is selected by a composite sort order.
 
 ---
 
@@ -18,7 +18,7 @@ LCP is defined as: `common_prefix_length / incoming_prompt_length`.
 The incoming prompt length (`tokens_b`) is used as the denominator, so the ratio represents what fraction of the new request can be served from the cached prefix.
 
 ```cpp
-// kv-cache-disk-manager.cpp, lines 339-357
+// kv-cache-disk-manager.cpp
 float kv_cache_disk_manager::calculate_lcp_ratio(
     const std::vector<int32_t> & tokens_a,
     const std::vector<int32_t> & tokens_b) const {
@@ -38,11 +38,16 @@ float kv_cache_disk_manager::calculate_lcp_ratio(
 
 An overload for `server_tokens` is also provided.
 
+The same LCP logic applies to all 3 tiers:
+- **L1**: `slot.prompt.tokens.get_common_prefix(task.tokens) / task.tokens.size()`
+- **L2**: `state.tokens.get_common_prefix(tokens_new) / tokens_new.size()`
+- **L3**: `calculate_lcp_ratio(entry.tokens, request.tokens)`
+
 ---
 
-## Radix Tree (Trie) — Candidate Pre-Filtering
+## Radix Tree (Trie) -- L3 Pre-Filtering
 
-The trie eliminates O(n) linear search. It provides O(m log k) prefix matching where m = token sequence length, k = unique tokens.
+The L3 disk cache uses a Radix Tree for O(m log k) prefix matching where m = token sequence length, k = unique tokens. This eliminates O(n x m) linear search over all cache entries.
 
 ### Insert
 
@@ -56,104 +61,173 @@ Each token in the sequence is traversed down the trie. The entry index (pointing
 
 `remove_entry()` walks all nodes recursively, removing stale entry indices.
 
+**Note**: L2 (RAM prompt cache) and L1 (slots) use linear scan over their respective arrays, which is acceptable at smaller scale.
+
 ---
 
-## Candidate Sorting
+## Candidate Collection per Tier
 
-The `find_matching_entry()` method (private) performs:
+### L3 -- `find_all_matching_entries()` (kv_cache_disk_manager)
 
-1. **Trie pre-filter**: get candidate indices from the trie
-2. **LCP computation**: calculate `calculate_lcp_ratio()` for each candidate
-3. **Threshold filter**: discard candidates below the configured threshold
-4. **Sort**: primary by similarity (descending), secondary by `access_order` (ascending — LRU tie-breaking)
-5. **Return**: top candidate
-6. **Update**: increment `access_order` for the matched entry
+Returns ALL matching entries above threshold, not just the best one, for use in the combined pool:
 
 ```cpp
-// kv-cache-disk-manager.cpp, lines 380-444
-disk_cache_entry * kv_cache_disk_manager::find_matching_entry(
-    const std::vector<int32_t> & tokens, float threshold) {
+// kv-cache-disk-manager.cpp
+std::vector<kv_cache_disk_manager::disk_cache_match> kv_cache_disk_manager::find_all_matching_entries(
+    const llama_tokens & tokens, float lcp_threshold) {
 
+    evict_expired_entries();
+    if (!trie_ || tokens.empty()) return {};
+
+    // Radix Tree pre-filter: O(m log k)
     std::vector<size_t> candidate_indices = trie_->search_prefix(tokens, 0.0f);
+    if (candidate_indices.empty()) return {};
 
-    if (candidate_indices.empty()) return nullptr;
-
-    struct candidate_entry {
-        disk_cache_entry * entry;
-        float              similarity;
-        int64_t            access_order;
-    };
-
-    std::vector<candidate_entry> valid_candidates;
-
+    std::vector<disk_cache_match> results;
     for (size_t idx : candidate_indices) {
         if (idx >= lru_ring_.size()) continue;
-
         float sim = calculate_lcp_ratio(lru_ring_[idx].metadata.tokens, tokens);
-        if (sim >= threshold) {
-            valid_candidates.push_back({ &lru_ring_[idx].metadata, sim, lru_ring_[idx].access_order });
+        if (sim >= effective_threshold) {
+            results.push_back({ lru_ring_[idx].metadata.filepath, sim,
+                                lru_ring_[idx].metadata.created_at_us });
         }
     }
+    return results;
+}
+```
 
-    if (valid_candidates.empty()) return nullptr;
+### L2 -- `find_all_matching()` (server_prompt_cache)
 
-    std::sort(valid_candidates.begin(), valid_candidates.end(),
-        [](const candidate_entry & a, const candidate_entry & b) {
-            if (std::abs(a.similarity - b.similarity) > 1e-6f)
-                return a.similarity > b.similarity;   // Higher similarity first
-            return a.access_order < b.access_order;    // LRU (older) first for ties
-        });
+Linear scan of all cached prompt states:
 
-    disk_cache_entry * result = valid_candidates.front().entry;
+```cpp
+std::vector<server_prompt_cache::prompt_cache_match> server_prompt_cache::find_all_matching(
+    const server_tokens & tokens_new, float threshold) const {
+    std::vector<prompt_cache_match> results;
+    for (const auto & state : states) {
+        const int   lcp_cur = state.tokens.get_common_prefix(tokens_new);
+        const float sim_cur = float(lcp_cur) / tokens_new.size();
+        if (sim_cur >= threshold) {
+            results.push_back({ sim_cur, state.created_us });
+        }
+    }
+    return results;
+}
+```
 
-    // Update LRU position for the matched entry
-    auto idx_it = filepath_index_.find(result->filepath);
-    if (idx_it != filepath_index_.end() && idx_it->second < lru_ring_.size())
-        lru_ring_[idx_it->second].access_order = ++access_counter_;
+### L1 -- Slots
 
-    return result;
+Iterates idle slots, computes common prefix ratio directly:
+
+```cpp
+for (server_slot & slot : slots) {
+    if (slot.is_processing()) continue;
+    const auto & tokens = slot.prompt.tokens;
+    if (tokens.empty()) continue;
+    const float sim = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+    if (sim > slot_prompt_similarity) {
+        candidates.push_back({ TIER_L1_SLOT, sim, slot.t_last_used, &slot, "" });
+    }
 }
 ```
 
 ---
 
-## Disk vs RAM Comparison
+## Combined 3-Tier Pool Sorting
 
-The disk cache search runs **once** (not per slot) in `get_available_slot()`. The returned filepath's LCP is compared against the best RAM LCP across all free slots:
+All candidates are combined into `vector<cache_candidate>` and sorted with a 3-key comparator:
+
+```cpp
+struct cache_candidate {
+    enum tier_t { TIER_L1_SLOT, TIER_L2_RAM, TIER_L3_DISK };
+    tier_t        tier;
+    float         similarity;     // LCP ratio (higher = better match)
+    int64_t       freshness;      // timestamp_us (higher = more recent)
+    server_slot * slot;           // L1 only
+    std::string   filepath;       // L3 only
+};
+
+std::sort(candidates.begin(), candidates.end(),
+    [](const cache_candidate & a, const cache_candidate & b) {
+        // 1. Similarity DESC -- best semantic match first
+        if (std::abs(a.similarity - b.similarity) > 1e-6f)
+            return a.similarity > b.similarity;
+        // 2. Freshness DESC -- most recent first for ties
+        if (a.freshness != b.freshness)
+            return a.freshness > b.freshness;
+        // 3. Tier priority -- L1 < L2 < L3 for equal similarity+freshness
+        return a.tier < b.tier;
+    });
+```
+
+### Selection Outcomes
+
+| Best Tier | Action |
+|---|---|
+| **L1** (slot) | Use directly (KV already in GPU) |
+| **L2** (RAM) | Load from RAM to slot via `prompt_load()` |
+| **L3** (disk) | Restore from disk + promote L3->L2 via `prompt_save()` |
+| None | LRU fallback (oldest `t_last_used`) |
+
+### Example Scenarios
 
 ```
-if (disk_lcp > best_ram_lcp)
-    restore_from_disk() to first free slot
-else if (best_ram_lcp > disk_lcp)
-    log "RAM cache preferred", fall through to prompt-similarity / LRU
-else
-    // equal: fall through (RAM preferred by default)
+Incoming prompt: "The quick brown fox jumps over the lazy dog"
+
+Candidates:
+  L3: "The quick brown fox"       sim=0.44, created=10:00
+  L2: "The quick brown fox jumps" sim=0.56, created=09:55
+  L1: "The quick brown"           sim=0.33, t_last=09:58
+
+Combined pool (sorted):
+  1. L2, sim=0.56, fresh=09:55   ← BEST
+  2. L3, sim=0.44, fresh=10:00
+  3. L1, sim=0.33, fresh=09:58
+
+Best: L2 (RAM) -- load to slot
+```
+
+```
+Incoming prompt: "The quick brown fox jumps over the lazy dog"
+
+Candidates:
+  L3: "The quick brown fox jumps over the lazy"  sim=0.78, created=10:05
+  L2: "The quick brown"                          sim=0.33, created=09:50
+
+Combined pool (sorted):
+  1. L3, sim=0.78, fresh=10:05   ← BEST
+  2. L2, sim=0.33, fresh=09:50
+
+Best: L3 (disk) -- restore to slot + promote to L2
 ```
 
 ---
 
 ## Configurable Threshold
 
-The threshold is set from `--slot-prompt-similarity` at initialization:
+The single `--slot-prompt-similarity` threshold applies to all 3 tiers:
 
 ```cpp
-// server-context.cpp, line 1311
+// server-context.cpp
 kv_cache_disk_mgr->set_prompt_similarity_threshold(params_base.slot_prompt_similarity);
 ```
 
-The threshold is stored in `prompt_similarity_threshold_` and used as the `effective_threshold` in `find_cache_entry()` when no explicit threshold is passed.
+The threshold is used as:
+- **L1**: `sim > slot_prompt_similarity` (strictly greater)
+- **L2**: `sim >= threshold` (greater or equal)
+- **L3**: `sim >= effective_threshold` (greater or equal)
 
 - **Lower values**: more aggressive caching (more hits, potentially less accurate)
 - **Higher values**: conservative caching (fewer hits, higher accuracy)
 
 ---
 
-## Performance Comparison
+## Performance Comparison (L3 only)
 
-| Cache Size  | Linear Search | Radix Tree | Speedup |
-|-------------|---------------|------------|---------|
-| 100 entries | 5,000 ops     | ~50 ops    | **100x** |
-| 1,000 entries | 100,000 ops | ~100 ops   | **1,000x** |
+| Cache Size | Linear Search | Radix Tree | Speedup |
+|---|---|---|---|
+| 100 entries | 5,000 ops | ~50 ops | **100x** |
+| 1,000 entries | 100,000 ops | ~100 ops | **1,000x** |
 | 10,000 entries | 2,000,000 ops | ~200 ops | **10,000x** |
 
 ---
@@ -161,9 +235,10 @@ The threshold is stored in `prompt_similarity_threshold_` and used as the `effec
 ## Key Design Decisions
 
 | Decision | Rationale |
-|----------|-----------|
-| Radix Tree over linear search | O(m log k) vs O(n x m) — critical for large caches |
-| Sort by similarity then LRU | Best semantic match + deterministic tie-breaking |
-| Use --slot-prompt-similarity as default threshold | Consistent with existing prompt caching behavior |
-| Disk restore only if strictly better than RAM | Avoids unnecessary disk I/O when GPU already has the cache |
-| Single disk search (not per-slot) | Avoids redundant trie traversals |
+|---|---|
+| Radix Tree over linear search for L3 | O(m log k) vs O(n x m) -- critical for large disk caches |
+| Combined pool over sequential tier checks | Enables true cross-tier comparison (L3 with sim 0.9 beats L2 with 0.7) |
+| Sort: similarity > freshness > tier | Best semantic match first; recency breaks ties; L1 preferred when equal |
+| L3 -> L2 promotion on restore | Avoids re-reading disk if same prompt arrives again |
+| Single `--slot-prompt-similarity` for all tiers | Consistent configuration, predictable behavior |
+| `completed_successfully` gate | Prevents saving partial/corrupted KV state on interrupts |
