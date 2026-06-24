@@ -572,9 +572,9 @@ bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int3
     uint32_t version       = *(uint32_t *) (header + 4);
     uint32_t n_token_count = *(uint32_t *) (header + 8);
 
-    if (magic != LLAMA_STATE_SEQ_MAGIC) {
-        LOG_WRN("KV cache restore: invalid magic in '%s' (expected 0x%08x, got 0x%08x)\n", filepath.c_str(),
-                LLAMA_STATE_SEQ_MAGIC, magic);
+    if (magic != LLAMA_STATE_SEQ_MAGIC && magic != LLAMA_STATE_SEQ_MAGIC_COMPRESSED) {
+        LOG_WRN("KV cache restore: invalid magic in '%s' (expected 0x%08x or 0x%08x, got 0x%08x)\n", filepath.c_str(),
+                LLAMA_STATE_SEQ_MAGIC, LLAMA_STATE_SEQ_MAGIC_COMPRESSED, magic);
         return false;
     }
 

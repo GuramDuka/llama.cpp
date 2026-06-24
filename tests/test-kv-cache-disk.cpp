@@ -711,6 +711,195 @@ int main(int argc, char ** argv) {
     });
 
     // -----------------------------------------------------------------------
+    // Test: Compressed save and restore (zstd level 3)
+    // -----------------------------------------------------------------------
+
+#ifdef LLAMA_HAS_ZSTD
+    t.test("compressed_save_restore", [&](testing & t) {
+        char filepath[512];
+        snprintf(filepath, sizeof(filepath), "%s/zstd.bin", cache_dir);
+
+        // Create context with compression level 3
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx                = 256;
+        cp.compress_kv_cache    = 3;
+        auto ctx_z              = llama_context_ptr{ llama_init_from_model(model, cp) };
+
+        // Decode prompt
+        llama_batch batch_z = llama_batch_init((int) prompt_tok.size(), 0, 1);
+        for (int i = 0; i < (int) prompt_tok.size(); ++i) {
+            common_batch_add(batch_z, prompt_tok[i], i, { 0 }, true);
+        }
+        t.assert_true("decode", llama_decode(ctx_z.get(), batch_z) == 0);
+        llama_batch_free(batch_z);
+
+        // Save with compression
+        size_t written = llama_state_seq_save_file(ctx_z.get(), filepath, 0, prompt_tok.data(), prompt_tok.size());
+        t.assert_true("compressed save produces data", written > 0);
+
+        // Verify compressed magic
+        uint32_t magic = 0, version = 0, n_tok = 0;
+        t.assert_true("header readable", read_header(filepath, &magic, &version, &n_tok));
+        t.assert_true("compressed magic", magic == LLAMA_STATE_SEQ_MAGIC_COMPRESSED);
+        t.assert_true("token count matches", n_tok == (uint32_t) prompt_tok.size());
+
+        // Restore
+        std::vector<int32_t> buf(prompt_tok.size());
+        size_t               n_out = 0;
+        size_t loaded = llama_state_seq_load_file(ctx_z.get(), filepath, -1, buf.data(), prompt_tok.size(), &n_out);
+        t.assert_true("compressed restore succeeds", loaded > 0);
+        t.assert_true("restored tokens match", n_out == prompt_tok.size());
+        for (size_t i = 0; i < n_out; ++i) {
+            t.assert_true("token", buf[i] == prompt_tok[i]);
+        }
+
+        std::filesystem::remove(filepath);
+    });
+
+    // Test: Compression with fast mode (negative level)
+    t.test("compressed_fast_mode", [&](testing & t) {
+        char filepath[512];
+        snprintf(filepath, sizeof(filepath), "%s/zstd_fast.bin", cache_dir);
+
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx                = 256;
+        cp.compress_kv_cache    = -1;  // fast mode
+        auto ctx_zf             = llama_context_ptr{ llama_init_from_model(model, cp) };
+
+        llama_batch batch_zf = llama_batch_init((int) prompt_tok.size(), 0, 1);
+        for (int i = 0; i < (int) prompt_tok.size(); ++i) {
+            common_batch_add(batch_zf, prompt_tok[i], i, { 0 }, true);
+        }
+        t.assert_true("decode", llama_decode(ctx_zf.get(), batch_zf) == 0);
+        llama_batch_free(batch_zf);
+
+        size_t written = llama_state_seq_save_file(ctx_zf.get(), filepath, 0, prompt_tok.data(), prompt_tok.size());
+        t.assert_true("fast save produces data", written > 0);
+
+        uint32_t magic = 0, version = 0, n_tok = 0;
+        t.assert_true("header readable", read_header(filepath, &magic, &version, &n_tok));
+        t.assert_true("compressed magic", magic == LLAMA_STATE_SEQ_MAGIC_COMPRESSED);
+
+        std::vector<int32_t> buf(prompt_tok.size());
+        size_t               n_out = 0;
+        size_t loaded = llama_state_seq_load_file(ctx_zf.get(), filepath, -1, buf.data(), prompt_tok.size(), &n_out);
+        t.assert_true("fast restore succeeds", loaded > 0);
+
+        std::filesystem::remove(filepath);
+    });
+
+    // Test: Backward compat — uncompressed file loads with compression context
+    t.test("compressed_backward_compat", [&](testing & t) {
+        char filepath[512];
+        snprintf(filepath, sizeof(filepath), "%s/uncomp.bin", cache_dir);
+
+        // Save without compression (using main context ctx, which has compress_kv_cache=0)
+        size_t written = llama_state_seq_save_file(ctx, filepath, 0, prompt_tok.data(), prompt_tok.size());
+        t.assert_true("uncompressed save", written > 0);
+
+        // Create context WITH compression enabled
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx                = 256;
+        cp.compress_kv_cache    = 3;
+        auto ctx_bc             = llama_context_ptr{ llama_init_from_model(model, cp) };
+
+        std::vector<int32_t> buf(prompt_tok.size());
+        size_t               n_out = 0;
+        size_t loaded = llama_state_seq_load_file(ctx_bc.get(), filepath, -1, buf.data(), prompt_tok.size(), &n_out);
+        t.assert_true("backward compat load", loaded > 0);
+        t.assert_true("tokens match", n_out == prompt_tok.size());
+
+        std::filesystem::remove(filepath);
+    });
+
+    // Test: Compressed file is strictly smaller than uncompressed
+    t.test("compressed_size_reduction", [&](testing & t) {
+        char uc_path[512];
+        char cc_path[512];
+        snprintf(uc_path, sizeof(uc_path), "%s/ref_uc.bin", cache_dir);
+        snprintf(cc_path, sizeof(cc_path), "%s/ref_cc.bin", cache_dir);
+
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx                = 256;
+
+        // Uncompressed
+        auto        ctx_uc   = llama_context_ptr{ llama_init_from_model(model, cp) };
+        llama_batch batch_uc = llama_batch_init((int) prompt_tok.size(), 0, 1);
+        for (int i = 0; i < (int) prompt_tok.size(); ++i) {
+            common_batch_add(batch_uc, prompt_tok[i], i, { 0 }, true);
+        }
+        t.assert_true("decode uc", llama_decode(ctx_uc.get(), batch_uc) == 0);
+        llama_batch_free(batch_uc);
+        size_t uc_sz = llama_state_seq_save_file(ctx_uc.get(), uc_path, 0, prompt_tok.data(), prompt_tok.size());
+        t.assert_true("uncompressed save", uc_sz > 0);
+
+        // Compressed
+        cp.compress_kv_cache = 3;
+        auto        ctx_cc   = llama_context_ptr{ llama_init_from_model(model, cp) };
+        llama_batch batch_cc = llama_batch_init((int) prompt_tok.size(), 0, 1);
+        for (int i = 0; i < (int) prompt_tok.size(); ++i) {
+            common_batch_add(batch_cc, prompt_tok[i], i, { 0 }, true);
+        }
+        t.assert_true("decode cc", llama_decode(ctx_cc.get(), batch_cc) == 0);
+        llama_batch_free(batch_cc);
+        size_t cc_sz = llama_state_seq_save_file(ctx_cc.get(), cc_path, 0, prompt_tok.data(), prompt_tok.size());
+        t.assert_true("compressed save", cc_sz > 0);
+
+        t.assert_true("compressed < uncompressed", cc_sz < uc_sz);
+
+        std::filesystem::remove(uc_path);
+        std::filesystem::remove(cc_path);
+    });
+
+    // Test: Dictionary learning levels 0..3 all produce valid compressed files
+    t.test("compress_learn_levels", [&](testing & t) {
+        struct {
+            const char *                            name;
+            enum llama_kv_cache_compress_learn_type val;
+        } levels[] = {
+            { "none",         LLAMA_KV_CACHE_COMPRESS_LEARN_NONE         },
+            { "sample-first", LLAMA_KV_CACHE_COMPRESS_LEARN_SAMPLE_FIRST },
+            { "incremental",  LLAMA_KV_CACHE_COMPRESS_LEARN_INCREMENTAL  },
+            { "continuous",   LLAMA_KV_CACHE_COMPRESS_LEARN_CONTINUOUS   },
+        };
+        for (const auto & lv : levels) {
+            char filepath[512];
+            snprintf(filepath, sizeof(filepath), "%s/learn_%s.bin", cache_dir, lv.name);
+
+            llama_context_params cp    = llama_context_default_params();
+            cp.n_ctx                   = 256;
+            cp.compress_kv_cache       = 3;
+            cp.compress_kv_cache_learn = lv.val;
+            auto ctx_l                 = llama_context_ptr{ llama_init_from_model(model, cp) };
+
+            llama_batch batch_l = llama_batch_init((int) prompt_tok.size(), 0, 1);
+            for (int i = 0; i < (int) prompt_tok.size(); ++i) {
+                common_batch_add(batch_l, prompt_tok[i], i, { 0 }, true);
+            }
+            t.assert_true("decode", llama_decode(ctx_l.get(), batch_l) == 0);
+            llama_batch_free(batch_l);
+
+            size_t written = llama_state_seq_save_file(ctx_l.get(), filepath, 0, prompt_tok.data(), prompt_tok.size());
+            t.assert_true(("learn=" + std::string(lv.name) + " save").c_str(), written > 0);
+
+            uint32_t magic = 0, version = 0, n_tok = 0;
+            t.assert_true(("learn=" + std::string(lv.name) + " header").c_str(),
+                          read_header(filepath, &magic, &version, &n_tok));
+            t.assert_true(("learn=" + std::string(lv.name) + " magic").c_str(),
+                          magic == LLAMA_STATE_SEQ_MAGIC_COMPRESSED);
+
+            std::vector<int32_t> buf(prompt_tok.size());
+            size_t               n_out = 0;
+            size_t loaded = llama_state_seq_load_file(ctx_l.get(), filepath, -1, buf.data(), prompt_tok.size(), &n_out);
+            t.assert_true(("learn=" + std::string(lv.name) + " restore").c_str(), loaded > 0);
+            t.assert_true(("learn=" + std::string(lv.name) + " tokens").c_str(), n_out == prompt_tok.size());
+
+            std::filesystem::remove(filepath);
+        }
+    });
+#endif
+
+    // -----------------------------------------------------------------------
     // Cleanup
     // -----------------------------------------------------------------------
 

@@ -4,6 +4,7 @@
 #include "common.h"
 #include "fit.h"
 #include "kv-cache-disk-manager.h"
+#include "kv-cache-metrics-collector.h"
 #include "llama.h"
 #include "log.h"
 #include "mtmd-helper.h"
@@ -934,6 +935,9 @@ struct server_context_impl {
     // Automatic KV cache disk manager
     std::unique_ptr<kv_cache_disk_manager> kv_cache_disk_mgr;
 
+    // Tiered KV cache metrics collector (L1/L2/L3 + compression)
+    kv_cache_metrics_collector cache_metrics;
+
     std::string           model_name;     // name of the loaded model, to be used by API
     std::set<std::string> model_aliases;  // additional names for the model
     std::set<std::string> model_tags;     // informational tags
@@ -1326,9 +1330,18 @@ struct server_context_impl {
                     SRV_WRN("%s\n", "Failed to initialize KV cache disk manager");
                 } else {
                     kv_cache_disk_mgr->set_prompt_similarity_threshold(params_base.slot_prompt_similarity);
-                    LOG_INF("KV cache auto enabled: dir='%s', max=%.1f GB, ttl=%" PRId64 "s, sim_threshold=%.3f\n",
-                            cache_dir.c_str(), params_base.max_cache_size_gb, params_base.cache_ttl_seconds,
-                            params_base.slot_prompt_similarity);
+                    if (params_base.compress_kv_cache.has_value()) {
+                        LOG_INF("KV cache auto enabled: dir='%s', max=%.1f GB, ttl=%" PRId64
+                                "s, sim_threshold=%.3f, "
+                                "compress=zstd level %d, learn=%d\n",
+                                cache_dir.c_str(), params_base.max_cache_size_gb, params_base.cache_ttl_seconds,
+                                params_base.slot_prompt_similarity, params_base.compress_kv_cache.value(),
+                                params_base.compress_kv_cache_learn);
+                    } else {
+                        LOG_INF("KV cache auto enabled: dir='%s', max=%.1f GB, ttl=%" PRId64 "s, sim_threshold=%.3f\n",
+                                cache_dir.c_str(), params_base.max_cache_size_gb, params_base.cache_ttl_seconds,
+                                params_base.slot_prompt_similarity);
+                    }
                 }
             }
         }
@@ -1405,8 +1418,11 @@ struct server_context_impl {
                 if (slot.task_tokens_original.empty()) {
                     return;
                 }
-                kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft, slot.task_tokens_original.data(),
-                                                slot.task_tokens_original.size());
+                const int64_t save_start = ggml_time_us();
+                bool          ok =
+                    kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
+                                                    slot.task_tokens_original.data(), slot.task_tokens_original.size());
+                cache_metrics.on_l3_save(ggml_time_us() - save_start, 0, 0, ok);
             };
 
             slot.callback_save_kv_cache_to_ram = [this, &slot]() {
@@ -1414,8 +1430,12 @@ struct server_context_impl {
                     return;
                 }
                 // Save the slot's KV cache state to the in-RAM prompt cache (L2)
-                slot.prompt_save(*prompt_cache);
-                prompt_cache->update();
+                const int64_t l2_save_start = ggml_time_us();
+                bool          save_ok       = slot.prompt_save(*prompt_cache);
+                if (save_ok) {
+                    prompt_cache->update();
+                }
+                cache_metrics.on_l2_save(ggml_time_us() - l2_save_start, save_ok);
             };
 
             slot.reset();
@@ -1647,25 +1667,33 @@ struct server_context_impl {
             std::vector<cache_candidate> candidates;
 
             // --- L1: Slots (in-GPU KV cache) ---
-            for (server_slot & slot : slots) {
-                if (slot.is_processing()) {
-                    continue;
-                }
+            {
+                const int64_t l1_start = ggml_time_us();
+                bool          l1_hit   = false;
+                for (server_slot & slot : slots) {
+                    if (slot.is_processing()) {
+                        continue;
+                    }
 
-                const auto & tokens = slot.prompt.tokens;
-                if (tokens.empty()) {
-                    continue;
-                }
+                    const auto & tokens = slot.prompt.tokens;
+                    if (tokens.empty()) {
+                        continue;
+                    }
 
-                const float sim = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
-                if (sim > slot_prompt_similarity) {
-                    candidates.push_back({ cache_candidate::TIER_L1_SLOT, sim, slot.t_last_used, &slot, "" });
+                    const float sim = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+                    if (sim > slot_prompt_similarity) {
+                        candidates.push_back({ cache_candidate::TIER_L1_SLOT, sim, slot.t_last_used, &slot, "" });
+                        l1_hit = true;
+                    }
                 }
+                cache_metrics.on_l1_find(ggml_time_us() - l1_start, l1_hit);
             }
 
             // --- L2: RAM prompt_cache ---
             if (prompt_cache) {
-                auto l2_matches = prompt_cache->find_all_matching(task.tokens, slot_prompt_similarity);
+                const int64_t l2_start   = ggml_time_us();
+                auto          l2_matches = prompt_cache->find_all_matching(task.tokens, slot_prompt_similarity);
+                cache_metrics.on_l2_find(ggml_time_us() - l2_start, !l2_matches.empty());
                 for (const auto & m : l2_matches) {
                     candidates.push_back({ cache_candidate::TIER_L2_RAM, m.similarity, m.timestamp_us, nullptr, "" });
                 }
@@ -1673,8 +1701,10 @@ struct server_context_impl {
 
             // --- L3: Disk cache ---
             if (kv_cache_disk_mgr) {
-                auto l3_matches =
+                const int64_t l3_start = ggml_time_us();
+                auto          l3_matches =
                     kv_cache_disk_mgr->find_all_matching_entries(task.tokens.get_tokens(), slot_prompt_similarity);
+                cache_metrics.on_l3_find(ggml_time_us() - l3_start, !l3_matches.empty());
                 for (const auto & m : l3_matches) {
                     candidates.push_back(
                         { cache_candidate::TIER_L3_DISK, m.similarity, m.timestamp_us, nullptr, m.filepath });
@@ -1715,15 +1745,22 @@ struct server_context_impl {
                             // Load from L2 (RAM prompt_cache) into an available slot
                             SRV_INF("best candidate from L2 (RAM cache), sim = %.3f, attempting restore\n",
                                     best.similarity);
-                            for (server_slot & slot : slots) {
-                                if (slot.is_processing()) {
-                                    continue;
+                            {
+                                const int64_t l2_load_start = ggml_time_us();
+                                bool          l2_ok         = false;
+                                for (server_slot & slot : slots) {
+                                    if (slot.is_processing()) {
+                                        continue;
+                                    }
+                                    if (slot.prompt_load(*prompt_cache, task.tokens)) {
+                                        ret   = &slot;
+                                        l2_ok = true;
+                                        SLT_INF(*ret, "restored slot from L2 prompt cache, sim = %.3f\n",
+                                                best.similarity);
+                                        break;
+                                    }
                                 }
-                                if (slot.prompt_load(*prompt_cache, task.tokens)) {
-                                    ret = &slot;
-                                    SLT_INF(*ret, "restored slot from L2 prompt cache, sim = %.3f\n", best.similarity);
-                                    break;
-                                }
+                                cache_metrics.on_l2_load(ggml_time_us() - l2_load_start, l2_ok);
                             }
                             l2_load_attempted = true;
                             break;
@@ -1733,23 +1770,31 @@ struct server_context_impl {
                             // Restore from L3 (disk cache) into an available slot
                             SRV_INF("best candidate from L3 (disk cache), sim = %.3f, attempting restore\n",
                                     best.similarity);
-                            for (server_slot & slot : slots) {
-                                if (slot.is_processing()) {
-                                    continue;
-                                }
-                                bool restored = kv_cache_disk_mgr->restore_from_disk(best.filepath, slot.id, ctx_tgt);
-                                if (restored) {
-                                    slot.prompt.tokens = server_tokens(task.tokens.get_tokens(), task.tokens.has_mtmd);
-                                    ret                = &slot;
-                                    SLT_INF(*ret, "restored slot from L3 disk cache '%s'\n", best.filepath.c_str());
-                                    // Per spec: if data is only in L3, also promote to L2 (RAM)
-                                    if (prompt_cache) {
-                                        slot.prompt_save(*prompt_cache);
-                                        prompt_cache->update();
-                                        SLT_INF(*ret, "%s", "promoted L3 restore to L2 prompt cache\n");
+                            {
+                                const int64_t l3_restore_start = ggml_time_us();
+                                bool          l3_ok            = false;
+                                for (server_slot & slot : slots) {
+                                    if (slot.is_processing()) {
+                                        continue;
                                     }
-                                    break;
+                                    bool restored =
+                                        kv_cache_disk_mgr->restore_from_disk(best.filepath, slot.id, ctx_tgt);
+                                    if (restored) {
+                                        slot.prompt.tokens =
+                                            server_tokens(task.tokens.get_tokens(), task.tokens.has_mtmd);
+                                        ret   = &slot;
+                                        l3_ok = true;
+                                        SLT_INF(*ret, "restored slot from L3 disk cache '%s'\n", best.filepath.c_str());
+                                        // Per spec: if data is only in L3, also promote to L2 (RAM)
+                                        if (prompt_cache) {
+                                            slot.prompt_save(*prompt_cache);
+                                            prompt_cache->update();
+                                            SLT_INF(*ret, "%s", "promoted L3 restore to L2 prompt cache\n");
+                                        }
+                                        break;
+                                    }
                                 }
+                                cache_metrics.on_l3_restore(ggml_time_us() - l3_restore_start, l3_ok);
                             }
                             break;
                         }
@@ -2924,6 +2969,8 @@ struct server_context_impl {
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+        // Periodic KV cache metrics log
+        cache_metrics.try_log(ggml_time_us());
 
         // check if all slots are idle
         {

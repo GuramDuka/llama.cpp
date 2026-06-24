@@ -237,6 +237,8 @@ Saves happen **before** `reset()`, so `task_tokens_original` and KV state are st
 | `--slot-prompt-similarity` | float | varies | L1+L2+L3 | LCP threshold for all 3 tiers |
 | `--max-cache-size <gb>` | float | 8.0 | L3 | Maximum disk cache size in GB (0 = unlimited) |
 | `--cache-ttl <seconds>` | int64 | 3600 | L3 | TTL for disk entries (0 = no expiration) |
+| `--kv-cache-compress <level>` | int / "none" | none | L3 | zstd compression level (-22..22); 0/none = disabled; negative = fast mode |
+| `--kv-cache-compress-learning <level>` | int / enum | `none` | L3 | Dictionary learning: `none`/0, `sample-first`/1, `incremental`/2, `continuous`/3 |
 
 ---
 
@@ -244,9 +246,18 @@ Saves happen **before** `reset()`, so `task_tokens_original` and KV state are st
 
 Cache files use the `llama_state_seq_save_file` / `llama_state_seq_load_file` format:
 
-- Header: magic (`LLAMA_STATE_SEQ_MAGIC`, 4 bytes) + version (4 bytes) + `n_token_count` (4 bytes)
+- Header: magic (`LLAMA_STATE_SEQ_MAGIC` or `LLAMA_STATE_SEQ_MAGIC_COMPRESSED`, 4 bytes) + version (4 bytes) + `n_token_count` (4 bytes)
 - Token data: `n_token_count` int32 values
-- KV cache data: variable length
+- KV cache data: variable length (zstd-compressed if magic is `LLAMA_STATE_SEQ_MAGIC_COMPRESSED`)
+
+### Compression
+
+When `--kv-cache-compress` is set to a non-zero value, the disk cache uses **zstd** to transparently compress KV state data:
+
+- **Magic detection**: Compressed files use `LLAMA_STATE_SEQ_MAGIC ^ 0x20242025u` (`LLAMA_STATE_SEQ_MAGIC_COMPRESSED`). Uncompressed files (from older versions) are still readable — the loader checks both magic values.
+- **zstd level**: -22 (fastest) to 22 (ultra). Negative values enable zstd's fast mode.
+- **Dictionary training** (`--kv-cache-compress-learning`): When enabled, a zstd dictionary is trained from previously saved KV cache data using `ZDICT_optimizeTrainFromBuffer_fastCover`. The dictionary (112 KB target, ~0.2s training time for 10 MB of samples) is stored in process memory and reused for subsequent saves. At level 1 ("sample-first"), samples are collected from the first save and the dictionary is trained immediately. Level 2 ("incremental") accumulates samples across saves and retrains periodically. Level 3 ("continuous") retrains on every save for maximum adaptivity.
+- **Build dependency**: Requires `libzstd` (found via pkg-config). If zstd is not found, the `--kv-cache-compress` flag still accepts values but will log a warning and the setting is silently ignored.
 
 ---
 
@@ -288,6 +299,8 @@ In this case:
    same K/V types, same n_stream)
 4. The **raw K/V tensor data from the wrong model is loaded** into the
    context, producing garbage output or silent corruption
+
+**Note**: When `--kv-cache-compress` is enabled, the same security considerations apply but with an additional subtlety: compressed KV data from a foreign model that happens to have the same structural parameters (layers, types, n_stream) will decompress "successfully" with the same corruption risk.
 
 ### Root Cause
 

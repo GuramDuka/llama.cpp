@@ -1353,6 +1353,59 @@ common_params_context common_params_parser_init(common_params & params,
                 })
                 .set_env("LLAMA_ARG_CACHE_TTL")
                 .set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg({ "--kv-cache-compress" }, "LEVEL",
+                       "KV cache disk compression level (zstd). "
+                       "none = disabled, -22..-1 = fast mode, 1..22 = normal mode. "
+                       "Default: none",
+                       [](common_params & params, const std::string & value) {
+                           if (value == "none" || value == "0") {
+                               params.compress_kv_cache.reset();
+                           } else {
+                               int level = std::stoi(value);
+                               if (level < -22) {
+                                   level = -22;
+                               }
+                               if (level > 22) {
+                                   level = 22;
+                               }
+                               params.compress_kv_cache = level;
+                           }
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg({ "--kv-cache-compress-learning" }, "LEVEL",
+                       "KV cache dictionary learning level. "
+                       "none/0 = disabled, sample-first/1 (train from first save, ~0.2s), "
+                       "incremental/2 (retrain every 10 saves), "
+                       "continuous/3 (background thread, periodic retrain). "
+                       "Default: none",
+                       [](common_params & params, const std::string & value) {
+                           static const struct {
+                               const char *                            name;
+                               enum llama_kv_cache_compress_learn_type val;
+                           } table[] = {
+                               { "none",         LLAMA_KV_CACHE_COMPRESS_LEARN_NONE         },
+                               { "sample-first", LLAMA_KV_CACHE_COMPRESS_LEARN_SAMPLE_FIRST },
+                               { "incremental",  LLAMA_KV_CACHE_COMPRESS_LEARN_INCREMENTAL  },
+                               { "continuous",   LLAMA_KV_CACHE_COMPRESS_LEARN_CONTINUOUS   },
+                           };
+                           // try named lookup first
+                           for (const auto & entry : table) {
+                               if (value == entry.name) {
+                                   params.compress_kv_cache_learn = entry.val;
+                                   return;
+                               }
+                           }
+                           // fallback: numeric
+                           int level = std::stoi(value);
+                           if (level < 0) {
+                               level = 0;
+                           }
+                           if (level > 3) {
+                               level = 3;
+                           }
+                           params.compress_kv_cache_learn = (enum llama_kv_cache_compress_learn_type) level;
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg({ "--context-shift" }, { "--no-context-shift" },
                        string_format("whether to use context shift on infinite text generation (default: %s)",
                                      params.ctx_shift ? "enabled" : "disabled"),

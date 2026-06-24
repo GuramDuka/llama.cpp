@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -669,6 +670,10 @@ struct common_params {
     bool    kv_cache_auto     = false;  // enable automatic KV cache save/restore on disk
     float   max_cache_size_gb = 8.0f;   // maximum total cache size per backend in GB
     int64_t cache_ttl_seconds = 3600;   // delete cache files older than this (0 = disabled)
+
+    // KV cache disk compression (zstd)
+    std::optional<int>                      compress_kv_cache;  // nullopt = disabled, -22..22 = zstd level
+    enum llama_kv_cache_compress_learn_type compress_kv_cache_learn = LLAMA_KV_CACHE_COMPRESS_LEARN_NONE;
 
     // batched-bench params
     bool is_pp_shared   = false;

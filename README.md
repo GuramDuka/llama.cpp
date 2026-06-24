@@ -3,8 +3,9 @@
 **Fork features added on top of upstream:**
 
 - **Automatic KV Cache to Disk** (`--kv-cache-auto`) — server automatically saves/restores KV cache to/from disk on slot release, surviving restarts. Uses a radix-tree-backed disk cache manager with longest-common-prefix (LCP) matching, TTL eviction, and size-based limits. Implements a unified 3-tier pool (L1 slots, L2 RAM, L3 disk) with cross-tier sorting by LCP similarity, freshness, and tier priority; L3 candidates are promoted to both L2 and L1; save to L2+L3 only on successful completion.
+- **zstd KV Cache Compression** (`--kv-cache-compress`) — transparent zstd compression for disk-backed KV cache files, reducing disk I/O and storage by 2-10x depending on model/data. Supports levels -22 (fastest) to 22 (ultra) and optional dictionary training (`--kv-cache-compress-learning`) via `ZDICT_optimizeTrainFromBuffer_fastCover`. Compressed files use a distinct magic for automatic detection; uncompressed files remain readable.
 - **KV Cache Disk Manager** (`kv-cache-disk-manager.{cpp,h}`) — standalone C++ library for disk-backed KV cache management: save, restore, LCP search, trie rebuild, TTL/size eviction.
-- **Comprehensive Test Suite** — 20 Python integration tests (non-router + router mode) and C++ tests covering combined 3-tier pool sorting, disk persistence, LCP comparison, TTL eviction, trie rebuild, multi-model smoke tests. Registered as ctest targets.
+- **Comprehensive Test Suite** — 20 Python integration tests (non-router + router mode) and C++ tests covering combined 3-tier pool sorting, disk persistence, LCP comparison, TTL eviction, trie rebuild, zstd compression round-trips, multi-model smoke tests. Registered as ctest targets.
 
 **Implemented CLI options unique to this fork:**
 
@@ -13,6 +14,8 @@
 | `--kv-cache-auto` / `--no-kv-cache-auto` | — | Enable automatic KV cache save/restore to disk on slot release (Radix Tree LCP matching, TTL + size eviction) | disabled |
 | `-cgs`, `--max-cache-size-gb` | — | Maximum total KV cache size per backend in GB (`0 = unlimited`) | `5.0` |
 | `-cttl`, `--cache-ttl` | — | Delete cached slot files older than N seconds (`0 = no expiration`) | `3600` |
+| `--kv-cache-compress` | — | zstd compression level for KV cache disk files (-22..22, `none`=disabled) | `none` |
+| `--kv-cache-compress-learning` | — | Dictionary training mode for compression: `none`, `sample-first`, `incremental`, `continuous` | `none` |
 
 For the original upstream README, see below.
 

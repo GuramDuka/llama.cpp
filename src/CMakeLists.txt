@@ -53,6 +53,10 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+if (zstd_FOUND)
+    target_link_libraries(llama PUBLIC PkgConfig::zstd)
+    target_compile_definitions(llama PUBLIC LLAMA_HAS_ZSTD=1)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

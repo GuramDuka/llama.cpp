@@ -23,6 +23,11 @@ Low-level tests using the `testing.h` framework. Tests run with a real GGUF mode
 | `mismatched_load_fails_gracefully` | Corrupted KV data returns 0, no crash |
 | `wrong_n_stream_load_fails` | n_stream mismatch returns 0 gracefully |
 | `wrong_kv_type_load_fails` | Bad magic / wrong KV type returns 0 |
+| `compressed_save_restore` | Compressed save/load round-trip with zstd level 3, verifies magic + token integrity |
+| `compressed_fast_mode` | Compressed save/load with zstd level -1 (fast mode) |
+| `compressed_backward_compat` | Uncompressed file readable with compression-enabled context |
+| `compressed_size_reduction` | Compressed file is strictly smaller than uncompressed |
+| `compress_learn_levels` | Dictionary learning levels `none`, `sample-first`, `incremental`, `continuous` all produce valid compressed files |
 
 Run:
 ```bash

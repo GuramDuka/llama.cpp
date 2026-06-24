@@ -20,6 +20,8 @@ add_library(${TARGET} STATIC
     server-schema.cpp
     server-schema.h
     kv-cache-disk-manager.cpp
+    kv-cache-metrics-collector.cpp
+    kv-cache-metrics-collector.h
 )
 
 if (BUILD_SHARED_LIBS)
