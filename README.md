@@ -6,6 +6,14 @@
 - **KV Cache Disk Manager** (`kv-cache-disk-manager.{cpp,h}`) — standalone C++ library for disk-backed KV cache management: save, restore, LCP search, trie rebuild, TTL/size eviction.
 - **Comprehensive Test Suite** — 20 Python integration tests (non-router + router mode) and C++ tests covering disk persistence, LCP comparison, TTL eviction, trie rebuild, multi-model smoke tests. Registered as ctest targets.
 
+**Implemented CLI options unique to this fork:**
+
+| Flag | Short | Description | Default |
+| --- | --- | --- | --- |
+| `--kv-cache-auto` / `--no-kv-cache-auto` | — | Enable automatic KV cache save/restore to disk on slot release (Radix Tree LCP matching, TTL + size eviction) | disabled |
+| `-cgs`, `--max-cache-size-gb` | — | Maximum total KV cache size per backend in GB (`0 = unlimited`) | `5.0` |
+| `-cttl`, `--cache-ttl` | — | Delete cached slot files older than N seconds (`0 = no expiration`) | `3600` |
+
 For the original upstream README, see below.
 
 ---
