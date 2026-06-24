@@ -20,6 +20,9 @@ Low-level tests using the `testing.h` framework. Tests run with a real GGUF mode
 | `multiple_entries_lcp` | LCP between multiple prompt pairs with varying overlap |
 | `save_multiple_entries` | Save 3 files, verify each has a valid header |
 | `restore_different_ctx` | Save with n_ctx=256, restore with n_ctx=512 |
+| `mismatched_load_fails_gracefully` | Corrupted KV data returns 0, no crash |
+| `wrong_n_stream_load_fails` | n_stream mismatch returns 0 gracefully |
+| `wrong_kv_type_load_fails` | Bad magic / wrong KV type returns 0 |
 
 Run:
 ```bash
@@ -43,6 +46,9 @@ Integration tests using a real `llama-server` instance with `ServerPreset.tinyll
 | `test_ttl_eviction` | Cache entries expire after TTL seconds (3s TTL, verified with 4s wait) |
 | `test_save_on_success_only` | Request completes successfully -> saves to L2+L3; interrupted request -> skip all saves |
 | `test_callback_invocation_and_save` | Callback is invoked and KV cache is saved on request completion |
+| `test_cross_model_cache_isolation` | Two different models share a cache directory: no crash, LRU fallback |
+| `test_shared_cache_directory_two_models` | Two models save to the same dir: cache files from both coexist |
+| `test_restart_with_foreign_cache_files` | Server rebuilds from cache dir containing files from another model |
 
 Run:
 ```bash

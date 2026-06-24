@@ -250,6 +250,85 @@ Cache files use the `llama_state_seq_save_file` / `llama_state_seq_load_file` fo
 
 ---
 
+## Cross-Model Safety (Known Gaps)
+
+### Current Validation on Load
+
+When restoring from disk (`llama_state_seq_load_file` / `llama_kv_cache::state_read`),
+the following are validated and will cause load to fail gracefully (return 0):
+
+| Check | Detection | Outcome |
+|-------|-----------|---------|
+| **Magic + version** (header) | `LLAMA_STATE_SEQ_MAGIC` / version field | Load rejected |
+| **n_stream mismatch** | `n_stream_cur != n_stream` | `std::runtime_error` caught, load returns 0 |
+| **Layer count mismatch** | `n_layer != layers.size()` | Load returns 0 |
+| **K type mismatch** (per layer) | `k_type_i != k_type_i_ref` | Load returns 0 |
+| **V type mismatch** (per layer) | `v_type_i != v_type_i_ref` | Load returns 0 |
+| **V-transposition mismatch** | `v_trans != saved_v_trans` | Load returns 0 |
+| **Row size mismatch** | key/value row size per layer | Load returns 0 |
+| **Cell count overflow** | `cell_count > cells.size()` | Load returns 0 |
+| **n_token_count > capacity** | token buffer overflow | Load returns 0 |
+
+These checks catch most accidental cross-model reuse when the models differ
+in architecture, layer count, or KV quantization type.
+
+### Silent Corruption Risk
+
+The following scenario is **NOT detected**:
+
+- Two models with the **same architecture** (same layer count, same n_stream,
+  same v_trans flag) and **same KV quantization type** but **different weights**
+  (e.g., two fine-tuned versions of the same base model, or the same model
+  with different GGUF quantization levels).
+
+In this case:
+1. The same prompt text produces the **same token IDs** (same tokenizer)
+2. The trie search finds a **match** (tokens match)
+3. `llama_state_seq_load_file` passes all structural checks (same layers,
+   same K/V types, same n_stream)
+4. The **raw K/V tensor data from the wrong model is loaded** into the
+   context, producing garbage output or silent corruption
+
+### Root Cause
+
+The `state_seq_save_file` / `state_seq_load_file` path (used by the disk
+cache) does **not** write or verify any model identity information. The
+full-state path (`state_write_data` / `state_read_data`) does write the
+model architecture string, but the sequence-level path used for per-
+sequence disk cache skips this step.
+
+Both paths have a TODO comment acknowledging this gap:
+```
+// TODO: add more model-specific info which should prevent loading the
+//       session file if not identical
+```
+
+No model hash, fingerprint, or checksum is embedded in cache files.
+
+### Mitigations (Current)
+
+- **Different tokenizers** (most common cross-model case): same text
+  produces different token IDs, so the trie won't match -> clean miss.
+- **Different KV quant types** (e.g., `f16` vs `q8_0`): caught by
+  per-layer type validation.
+- **Different architectures** (different layer counts): caught by
+  n_layer validation.
+- **n_stream changes** (e.g., dual-stream vs single-stream): caught
+  by n_stream mismatch check.
+
+### Recommended Future Work
+
+1. **Embed model fingerprint in cache files**: Write a hash of the model
+   file (or the model's `llama_model_desc` + parameter count) into the
+   sequence file header, and verify it before loading.
+2. **Per-model subdirectories**: Isolate cache files by model hash in
+   the cache directory to prevent accidental cross-contamination.
+3. **File-level re-validation**: After a successful `llama_state_seq_load_file`,
+   run a lightweight checksum on a portion of the restored KV data to
+   verify it matches expected values for the current model.
+
+---
+
 ## Thread Safety
 
 - `kv_cache_disk_manager`: all public methods guarded by `std::recursive_mutex mutex_`
