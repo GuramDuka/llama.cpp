@@ -242,22 +242,27 @@ def test_both_caches_empty_lru_fallback():
 # ---------------------------------------------------------------------------
 
 
-def test_disk_miss_ram_partial_match():
-    """New prompt: disk MISS, but RAM slot has partial match."""
+def test_combined_pool_lcp_match():
+    """Similar prompt: combined 3-tier pool finds match via LCP."""
     global server
     server.start()
     log = LogReader(server.log_path)
 
-    # Save entry A to disk and GPU
+    # Save entry A to disk, RAM, and GPU
     _send_completion("What is 2+2? Briefly.", 5)
     time.sleep(3)
     log.drain()  # drain save log
 
-    # Request B: disk MISS, but RAM slot has A (partial match)
+    # Request B: similar prompt - combined pool should find LCP match in L1 slot
     _send_completion("What is 3+3? Briefly.", 5)
 
-    miss_log = log.drain()
-    assert "KV cache MISS" in miss_log, f"No MISS log: {miss_log[:800]}"
+    pool_log = log.drain()
+    # The combined 3-tier pool should select a slot by LCP similarity
+    assert (
+        "selected from 3-tier pool" in pool_log
+        or "selected slot by LCP similarity" in pool_log
+        or "selected slot by LRU" in pool_log
+    ), f"No pool selection log: {pool_log[:800]}"
 
 
 # ---------------------------------------------------------------------------

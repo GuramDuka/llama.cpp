@@ -187,6 +187,18 @@ class kv_cache_disk_manager {
     // Cleanup all cache files (for manual purge)
     void purge_all_cache_files();
 
+    // Struct for a disk cache match with similarity score (used by combined 3-tier pool)
+    struct disk_cache_match {
+        std::string filepath;
+        float       similarity;
+        int64_t     timestamp_us;  // created_at_us for freshness comparison
+    };
+
+    // Find ALL matching disk cache entries (not just the best), with their similarity scores
+    // Used by the combined 3-tier cache pool (L1=slots, L2=RAM, L3=disk)
+    // Returns empty vector if no matches or trie not initialized
+    std::vector<disk_cache_match> find_all_matching_entries(const llama_tokens & tokens, float lcp_threshold);
+
     // Calculate LCP ratio between two token sequences (public for use in callbacks)
     float calculate_lcp_ratio(const std::vector<int32_t> & tokens_a, const std::vector<int32_t> & tokens_b) const;
 

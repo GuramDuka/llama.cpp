@@ -443,6 +443,62 @@ disk_cache_entry * kv_cache_disk_manager::find_matching_entry(const std::vector<
     return result;
 }
 
+// Find ALL matching disk cache entries (not just the best), with similarity scores
+// Used by the combined 3-tier cache pool (L1=slots, L2=RAM, L3=disk)
+std::vector<kv_cache_disk_manager::disk_cache_match> kv_cache_disk_manager::find_all_matching_entries(
+    const llama_tokens & tokens,
+    float                lcp_threshold) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+
+    evict_expired_entries();
+
+    if (!trie_ || tokens.empty()) {
+        metrics_.cache_misses++;
+        LOG("KV cache MISS: trie not initialized or tokens empty\n");
+        return {};
+    }
+
+    float effective_threshold = (lcp_threshold > 0.0f) ? lcp_threshold : prompt_similarity_threshold_;
+
+    LOG("KV cache find_all: tokens=%zu, threshold=%.3f, trie_nodes=%zu\n", tokens.size(), effective_threshold,
+        trie_->get_stats().total_nodes);
+
+    // Use Radix Tree for O(m log k) prefix matching
+    std::vector<size_t> candidate_indices = trie_->search_prefix(tokens, 0.0f);
+
+    if (candidate_indices.empty()) {
+        metrics_.cache_misses++;
+        LOG("KV cache MISS: no candidates found\n");
+        return {};
+    }
+
+    std::vector<disk_cache_match> results;
+    results.reserve(candidate_indices.size());
+
+    for (size_t idx : candidate_indices) {
+        if (idx >= lru_ring_.size()) {
+            continue;
+        }
+
+        float sim = calculate_lcp_ratio(lru_ring_[idx].metadata.tokens, tokens);
+
+        if (sim >= effective_threshold) {
+            results.push_back({ lru_ring_[idx].metadata.filepath, sim, lru_ring_[idx].metadata.created_at_us });
+        }
+    }
+
+    LOG("KV cache find_all: %zu candidates, %zu matched threshold\n", candidate_indices.size(), results.size());
+
+    if (results.empty()) {
+        metrics_.cache_misses++;
+        LOG("KV cache MISS: no entries above threshold\n");
+    } else {
+        metrics_.cache_hits += results.size();
+    }
+
+    return results;
+}
+
 // Find matching KV cache entry on disk for given token sequence
 std::string kv_cache_disk_manager::find_cache_entry(const llama_tokens & tokens, float lcp_threshold) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);

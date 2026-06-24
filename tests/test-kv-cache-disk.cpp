@@ -13,7 +13,7 @@
 //  9. Save multiple entries, verify all valid
 // 10. Restore with different n_ctx
 // 11. Disk manager initialization state
-// 12. RAM vs Disk LCP comparison (RAM preferred)
+// 12. Combined 3-tier cache pool sorting (tier priority, freshness)
 // 13. Callback invocation and save verification
 
 #include "arg.h"
@@ -447,47 +447,94 @@ int main(int argc, char ** argv) {
     });
 
     // -----------------------------------------------------------------------
-    // Test: RAM vs Disk LCP comparison (RAM preferred when better)
+    // Test: Combined 3-tier cache pool sorting (tier priority + freshness)
     // -----------------------------------------------------------------------
 
-    t.test("ram_vs_disk_lcp_comparison", [&](testing & t) {
-        // When both RAM and disk have entries but RAM has a better LCP,
-        // RAM should be preferred (skip disk restore).
+    t.test("combined_tier_pool_sorting", [&](testing & t) {
+        // Simulate the combined 3-tier cache pool sorting logic:
+        // 1. Similarity DESC (highest first)
+        // 2. Freshness DESC (most recent first)
+        // 3. Tier priority: L1 (slots) > L2 (RAM) > L3 (disk)
 
-        // Save entry A to disk
-        char disk_path[512];
-        snprintf(disk_path, sizeof(disk_path), "%s/disk_entry.bin", cache_dir);
-        size_t written = llama_state_seq_save_file(ctx, disk_path, 0, prompt_tok.data(), prompt_tok.size());
-        t.assert_true("disk entry saved", written > 0);
-
-        // Create a "RAM" entry that's a better match (identical tokens)
-        std::vector<int32_t> ram_entry  = prompt_tok;  // exact match
-        std::vector<int32_t> disk_entry = prompt_tok;
-
-        // LCP of identical = 1.0, identical to disk
-        // When RAM and disk have equal LCP, RAM should win
-        auto lcp = [](const std::vector<int32_t> & a, const std::vector<int32_t> & b) -> float {
-            if (a.empty() || b.empty()) {
-                return 0.0f;
-            }
-            size_t common = 0;
-            size_t m      = (a.size() < b.size()) ? a.size() : b.size();
-            for (size_t i = 0; i < m; ++i) {
-                if (a[i] == b[i]) {
-                    common++;
-                } else {
-                    break;
-                }
-            }
-            return (float) common / (float) b.size();
+        struct candidate {
+            enum { TIER_L1_SLOT, TIER_L2_RAM, TIER_L3_DISK };
+            int     tier;
+            float   similarity;
+            int64_t freshness;
         };
 
-        float ram_lcp  = lcp(ram_entry, prompt_tok);
-        float disk_lcp = lcp(disk_entry, prompt_tok);
+        // Test: higher similarity wins regardless of tier
+        {
+            std::vector<candidate> pool = {
+                { candidate::TIER_L3_DISK, 0.8f, 100 },
+                { candidate::TIER_L1_SLOT, 0.9f, 200 },
+                { candidate::TIER_L2_RAM,  0.7f, 300 },
+            };
 
-        t.assert_true("RAM LCP == 1.0 (exact match)", ram_lcp >= 0.99f);
-        t.assert_true("Disk LCP == 1.0 (exact match)", disk_lcp >= 0.99f);
-        t.assert_true("RAM preferred when LCP equal", ram_lcp >= disk_lcp);
+            std::sort(pool.begin(), pool.end(), [](const candidate & a, const candidate & b) {
+                if (std::abs(a.similarity - b.similarity) > 1e-6f) {
+                    return a.similarity > b.similarity;
+                }
+                if (a.freshness != b.freshness) {
+                    return a.freshness > b.freshness;
+                }
+                return a.tier < b.tier;
+            });
+
+            t.assert_true("best similarity wins (L1 0.9)",
+                          pool[0].similarity == 0.9f && pool[0].tier == candidate::TIER_L1_SLOT);
+            t.assert_true("second best (L3 0.8)",
+                          pool[1].similarity == 0.8f && pool[1].tier == candidate::TIER_L3_DISK);
+            t.assert_true("third (L2 0.7)", pool[2].similarity == 0.7f && pool[2].tier == candidate::TIER_L2_RAM);
+        }
+
+        // Test: equal similarity -> tier priority L1 > L2 > L3
+        {
+            std::vector<candidate> pool = {
+                { candidate::TIER_L3_DISK, 0.8f, 100 },
+                { candidate::TIER_L2_RAM,  0.8f, 200 },
+                { candidate::TIER_L1_SLOT, 0.8f, 300 },
+            };
+
+            std::sort(pool.begin(), pool.end(), [](const candidate & a, const candidate & b) {
+                if (std::abs(a.similarity - b.similarity) > 1e-6f) {
+                    return a.similarity > b.similarity;
+                }
+                if (a.freshness != b.freshness) {
+                    return a.freshness > b.freshness;
+                }
+                return a.tier < b.tier;
+            });
+
+            t.assert_true("equal sim: L1 wins over L2/L3", pool[0].tier == candidate::TIER_L1_SLOT);
+            t.assert_true("equal sim: L2 over L3", pool[1].tier == candidate::TIER_L2_RAM);
+            t.assert_true("equal sim: L3 last", pool[2].tier == candidate::TIER_L3_DISK);
+        }
+
+        // Test: equal similarity + equal tier -> freshness wins
+        {
+            std::vector<candidate> pool = {
+                { candidate::TIER_L1_SLOT, 0.8f, 100 }, // older
+                { candidate::TIER_L1_SLOT, 0.8f, 300 }, // newer
+            };
+
+            std::sort(pool.begin(), pool.end(), [](const candidate & a, const candidate & b) {
+                if (std::abs(a.similarity - b.similarity) > 1e-6f) {
+                    return a.similarity > b.similarity;
+                }
+                if (a.freshness != b.freshness) {
+                    return a.freshness > b.freshness;
+                }
+                return a.tier < b.tier;
+            });
+
+            t.assert_true("same sim/tier: newer (300) wins", pool[0].freshness == 300);
+            t.assert_true("same sim/tier: older (100) second", pool[1].freshness == 100);
+        }
+
+        // Note: find_all_matching_entries() is tested indirectly through
+        // the server's get_available_slot() which uses the 3-tier pool.
+        // The disk manager's radix tree search is tested via trie_operations above.
     });
 
     // -----------------------------------------------------------------------

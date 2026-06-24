@@ -285,6 +285,14 @@ struct server_slot {
     // Callback for saving KV cache to disk after generation (for --kv-cache-auto)
     std::function<void()> callback_save_kv_cache_to_disk;
 
+    // Callback for saving KV cache to RAM (L2 prompt cache) after successful generation
+    std::function<void()> callback_save_kv_cache_to_ram;
+
+    // Whether the request completed successfully (vs interrupted/cancelled)
+    // When true, save to L2 and L3 caches on release
+    // When false, skip all cache saves
+    bool completed_successfully = false;
+
     // Store original task tokens for KV cache matching (captured before task completion)
     std::vector<llama_token> task_tokens_original;
 
@@ -297,7 +305,8 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
-        n_prompt_tokens_cache = 0;
+        completed_successfully = false;
+        n_prompt_tokens_cache  = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -332,6 +341,9 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+
+        // clear task tokens (no stale data after reset)
+        task_tokens_original.clear();
     }
 
     void init_sampler() const {
@@ -476,7 +488,8 @@ struct server_slot {
         if (is_processing()) {
             GGML_ASSERT(task);
 
-            SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+            SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d, completed_successfully = %d\n",
+                    prompt.n_tokens(), truncated, (int) completed_successfully);
 
             t_last_used        = ggml_time_us();
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
@@ -488,12 +501,23 @@ struct server_slot {
                 prompt_clear(false);
             }
 
-            reset();
+            // Save to L2 (RAM) and L3 (disk) caches only on successful completion
+            // On interrupt/cancel/error: skip all saves (per 3-tier cache spec)
+            if (completed_successfully) {
+                // Save to L3 (disk) via callback
+                if (callback_save_kv_cache_to_disk) {
+                    callback_save_kv_cache_to_disk();
+                }
 
-            // Save KV cache to disk before releasing slot
-            if (callback_save_kv_cache_to_disk) {
-                callback_save_kv_cache_to_disk();
+                // Save to L2 (RAM prompt_cache) via callback
+                if (callback_save_kv_cache_to_ram) {
+                    callback_save_kv_cache_to_ram();
+                }
+            } else {
+                SLT_INF(*this, "%s", "request did not complete successfully, skipping cache save\n");
             }
+
+            reset();
 
             callback_on_release(id);
         }
@@ -1385,6 +1409,15 @@ struct server_context_impl {
                                                 slot.task_tokens_original.size());
             };
 
+            slot.callback_save_kv_cache_to_ram = [this, &slot]() {
+                if (!prompt_cache || !slot.ctx_tgt) {
+                    return;
+                }
+                // Save the slot's KV cache state to the in-RAM prompt cache (L2)
+                slot.prompt_save(*prompt_cache);
+                prompt_cache->update();
+            };
+
             slot.reset();
         }
 
@@ -1583,99 +1616,161 @@ struct server_context_impl {
         return nullptr;
     }
 
+    // Combined 3-tier cache candidate for slot selection
+    // Collects entries from L1 (slots), L2 (RAM prompt_cache), L3 (disk)
+    struct cache_candidate {
+        enum tier_t { TIER_L1_SLOT, TIER_L2_RAM, TIER_L3_DISK };
+
+        tier_t        tier;
+        float         similarity;  // LCP similarity to request tokens
+        int64_t       freshness;   // higher = more recent, for tiebreaking
+        server_slot * slot;        // L1 only
+        std::string   filepath;    // L3 only
+    };
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
-        bool update_cache = false;
-
-        // if a specific slot is requested, use it (still goes through cache update logic below)
+        // if a specific slot is requested, use it directly
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
             }
+            return ret;
         }
 
-        // Try to restore KV cache from disk before slot selection
-        if (kv_cache_disk_mgr && task.id_slot == -1) {
-            std::string disk_cache_file =
-                kv_cache_disk_mgr->find_cache_entry(task.tokens.get_tokens(), slot_prompt_similarity);
-            if (!disk_cache_file.empty()) {
-                // Find an available slot to restore into
-                for (server_slot & slot : slots) {
-                    if (slot.is_processing()) {
-                        continue;
-                    }
+        // Build the combined 3-tier candidate pool
+        bool l2_load_attempted = false;
 
-                    bool restored = kv_cache_disk_mgr->restore_from_disk(disk_cache_file, slot.id, ctx_tgt);
-                    if (restored) {
-                        slot.prompt.tokens = server_tokens(task.tokens.get_tokens(), task.tokens.has_mtmd);
-                        SLT_INF(slot, "restored slot from disk cache '%s'\n", disk_cache_file.c_str());
-                        ret = &slot;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
-            float sim_best = 0;
+            std::vector<cache_candidate> candidates;
 
+            // --- L1: Slots (in-GPU KV cache) ---
             for (server_slot & slot : slots) {
-                if (task.id_slot != -1 && slot.id != task.id_slot) {
-                    continue;
-                }
-
-                // skip the slot if it is not available
                 if (slot.is_processing()) {
                     continue;
                 }
 
                 const auto & tokens = slot.prompt.tokens;
-
-                // skip the slot if it does not contains cached tokens
                 if (tokens.empty()) {
                     continue;
                 }
 
-                // fraction of the Longest Common Prefix length with respect to the input prompt length
-                const float sim_cur = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
-
-                // select the current slot if the criteria match
-                if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
-                    sim_best = sim_cur;
-
-                    ret = &slot;
+                const float sim = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+                if (sim > slot_prompt_similarity) {
+                    candidates.push_back({ cache_candidate::TIER_L1_SLOT, sim, slot.t_last_used, &slot, "" });
                 }
             }
 
-            if (ret != nullptr) {
-                const float f_keep = (sim_best * task.tokens.size()) / ret->prompt.tokens.size();
-
-                if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                            sim_best, slot_prompt_similarity, f_keep);
+            // --- L2: RAM prompt_cache ---
+            if (prompt_cache) {
+                auto l2_matches = prompt_cache->find_all_matching(task.tokens, slot_prompt_similarity);
+                for (const auto & m : l2_matches) {
+                    candidates.push_back({ cache_candidate::TIER_L2_RAM, m.similarity, m.timestamp_us, nullptr, "" });
                 }
+            }
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
-                    update_cache = true;
+            // --- L3: Disk cache ---
+            if (kv_cache_disk_mgr) {
+                auto l3_matches =
+                    kv_cache_disk_mgr->find_all_matching_entries(task.tokens.get_tokens(), slot_prompt_similarity);
+                for (const auto & m : l3_matches) {
+                    candidates.push_back(
+                        { cache_candidate::TIER_L3_DISK, m.similarity, m.timestamp_us, nullptr, m.filepath });
                 }
+            }
+
+            // Sort candidates:
+            // 1. Similarity DESC (highest first)
+            // 2. Freshness DESC (most recent first)
+            // 3. Tier priority: L1 > L2 > L3
+            std::sort(candidates.begin(), candidates.end(), [](const cache_candidate & a, const cache_candidate & b) {
+                if (std::abs(a.similarity - b.similarity) > 1e-6f) {
+                    return a.similarity > b.similarity;
+                }
+                if (a.freshness != b.freshness) {
+                    return a.freshness > b.freshness;
+                }
+                return a.tier < b.tier;  // L1 < L2 < L3
+            });
+
+            // Pick best candidate
+            if (!candidates.empty()) {
+                const auto & best = candidates.front();
+
+                switch (best.tier) {
+                    case cache_candidate::TIER_L1_SLOT:
+                        {
+                            // Use the matching slot directly
+                            ret                = best.slot;
+                            const float f_keep = (best.similarity * task.tokens.size()) / ret->prompt.tokens.size();
+                            SLT_INF(*ret,
+                                    "selected slot by LCP similarity (L1), sim = %.3f (thold=%.3f), f_keep = %.3f\n",
+                                    best.similarity, slot_prompt_similarity, f_keep);
+                            break;
+                        }
+                    case cache_candidate::TIER_L2_RAM:
+                        {
+                            // Load from L2 (RAM prompt_cache) into an available slot
+                            SRV_INF("best candidate from L2 (RAM cache), sim = %.3f, attempting restore\n",
+                                    best.similarity);
+                            for (server_slot & slot : slots) {
+                                if (slot.is_processing()) {
+                                    continue;
+                                }
+                                if (slot.prompt_load(*prompt_cache, task.tokens)) {
+                                    ret = &slot;
+                                    SLT_INF(*ret, "restored slot from L2 prompt cache, sim = %.3f\n", best.similarity);
+                                    break;
+                                }
+                            }
+                            l2_load_attempted = true;
+                            break;
+                        }
+                    case cache_candidate::TIER_L3_DISK:
+                        {
+                            // Restore from L3 (disk cache) into an available slot
+                            SRV_INF("best candidate from L3 (disk cache), sim = %.3f, attempting restore\n",
+                                    best.similarity);
+                            for (server_slot & slot : slots) {
+                                if (slot.is_processing()) {
+                                    continue;
+                                }
+                                bool restored = kv_cache_disk_mgr->restore_from_disk(best.filepath, slot.id, ctx_tgt);
+                                if (restored) {
+                                    slot.prompt.tokens = server_tokens(task.tokens.get_tokens(), task.tokens.has_mtmd);
+                                    ret                = &slot;
+                                    SLT_INF(*ret, "restored slot from L3 disk cache '%s'\n", best.filepath.c_str());
+                                    // Per spec: if data is only in L3, also promote to L2 (RAM)
+                                    if (prompt_cache) {
+                                        slot.prompt_save(*prompt_cache);
+                                        prompt_cache->update();
+                                        SLT_INF(*ret, "%s", "promoted L3 restore to L2 prompt cache\n");
+                                    }
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                }
+            }
+
+            if (!candidates.empty() && ret) {
+                SLT_INF(*ret, "selected from 3-tier pool: %zu candidates, best tier=%d\n", candidates.size(),
+                        (int) candidates.front().tier);
             }
         }
 
-        // find the slot that has been least recently used
+        // LRU fallback: no matching candidate found in any tier
         if (ret == nullptr) {
             int64_t t_last = -1;
 
             for (server_slot & slot : slots) {
-                // skip the slot if it is not available
                 if (slot.is_processing()) {
                     continue;
                 }
 
-                // select the current slot if the criteria match
                 if (!ret || slot.t_last_used <= t_last) {
                     t_last = slot.t_last_used;
                     ret    = &slot;
@@ -1684,31 +1779,21 @@ struct server_context_impl {
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
-
-                update_cache = true;
+                l2_load_attempted = false;  // no cache match, don't attempt L2 load
             }
         }
 
-        if (ret) {
-            update_cache = update_cache && prompt_cache;
+        // After slot selection, try to load from L2 if we didn't already try
+        // (covers LRU and L1 selection cases where L2 may have a better match)
+        if (ret && !l2_load_attempted && prompt_cache && slot_prompt_similarity != 0.0f) {
+            const int   lcp_cur = ret->prompt.tokens.get_common_prefix(task.tokens);
+            const float sim_cur = ret->prompt.tokens.size() > 0 ? float(lcp_cur) / ret->prompt.tokens.size() : 0.0f;
 
-            // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-
-            if (update_cache) {
-                SRV_INF("%s", "updating prompt cache\n");
-
-                const int64_t t_start = ggml_time_us();
-
-                ret->prompt_save(*prompt_cache);
-
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear(false);
+            // If current slot has no cached tokens or low similarity, try L2
+            if (sim_cur < slot_prompt_similarity || ret->prompt.tokens.empty()) {
+                if (ret->prompt_load(*prompt_cache, task.tokens)) {
+                    SLT_INF(*ret, "%s", "restored slot from L2 prompt cache (post-selection)\n");
                 }
-
-                prompt_cache->update();
-
-                SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
         }
 
@@ -3847,6 +3932,7 @@ struct server_context_impl {
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
+                    slot.completed_successfully = true;
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -3854,6 +3940,7 @@ struct server_context_impl {
 
                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
                     send_rerank(slot, batch_view);
+                    slot.completed_successfully = true;
                     slot.release();
                     slot.i_batch = -1;
                     return;
@@ -3918,6 +4005,7 @@ struct server_context_impl {
                 slot.print_timings();
                 send_final_response(slot);
                 metrics.on_prediction(slot);
+                slot.completed_successfully = true;
                 slot.release();
 
                 return;
@@ -4045,6 +4133,7 @@ struct server_context_impl {
                     slot.print_timings();
                     send_final_response(slot);
                     metrics.on_prediction(slot);
+                    slot.completed_successfully = true;
                     slot.release();
 
                     return;
