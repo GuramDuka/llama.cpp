@@ -169,6 +169,20 @@ gh pr comment
 gh issue create
 ```
 
+## Fork-Specific Workflows
+
+### Update README Fork Features on Push to Master
+
+When merging to `master`, update the "Fork features" block at the top of `README.md`:
+
+1. Check `git log --oneline master --not upstream/master` for new feature commits.
+2. For each distinct feature area (new flag, new subsystem, new test category), add or update a bullet point in the fork features block.
+3. Keep each bullet concise (1-2 sentences). Focus on user-facing value: what flag was added, what it does, what tests cover it.
+4. If a feature was already listed and only received bugfixes or test additions, update the existing bullet rather than adding a new one.
+5. The fork features block goes above the `---` separator. Do not modify upstream content below it.
+
+---
+
 ## Useful Resources
 
 To conserve context space, load these resources as needed:
