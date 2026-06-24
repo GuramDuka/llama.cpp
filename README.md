@@ -2,9 +2,9 @@
 
 **Fork features added on top of upstream:**
 
-- **Automatic KV Cache to Disk** (`--kv-cache-auto`) — server automatically saves/restores KV cache to/from disk on slot release, surviving restarts. Uses a radix-tree-backed disk cache manager with longest-common-prefix (LCP) matching, TTL eviction, and size-based limits.
+- **Automatic KV Cache to Disk** (`--kv-cache-auto`) — server automatically saves/restores KV cache to/from disk on slot release, surviving restarts. Uses a radix-tree-backed disk cache manager with longest-common-prefix (LCP) matching, TTL eviction, and size-based limits. Implements a unified 3-tier pool (L1 slots, L2 RAM, L3 disk) with cross-tier sorting by LCP similarity, freshness, and tier priority; L3 candidates are promoted to both L2 and L1; save to L2+L3 only on successful completion.
 - **KV Cache Disk Manager** (`kv-cache-disk-manager.{cpp,h}`) — standalone C++ library for disk-backed KV cache management: save, restore, LCP search, trie rebuild, TTL/size eviction.
-- **Comprehensive Test Suite** — 20 Python integration tests (non-router + router mode) and C++ tests covering disk persistence, LCP comparison, TTL eviction, trie rebuild, multi-model smoke tests. Registered as ctest targets.
+- **Comprehensive Test Suite** — 20 Python integration tests (non-router + router mode) and C++ tests covering combined 3-tier pool sorting, disk persistence, LCP comparison, TTL eviction, trie rebuild, multi-model smoke tests. Registered as ctest targets.
 
 **Implemented CLI options unique to this fork:**
 
