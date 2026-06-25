@@ -49,8 +49,8 @@ Integration tests using a real `llama-server` instance with `ServerPreset.tinyll
 | `test_combined_pool_lcp_match` | Combined pool: L3 candidates collected and sorted alongside L1+L2; best candidate wins across tiers |
 | `test_trie_rebuild_from_disk` | Restart server: trie rebuild from disk, cache HIT for same request |
 | `test_ttl_eviction` | Cache entries expire after TTL seconds (3s TTL, verified with 4s wait) |
-| `test_save_on_success_only` | Request completes successfully -> saves to L2+L3; interrupted request -> skip all saves |
-| `test_callback_invocation_and_save` | Callback is invoked and KV cache is saved on request completion |
+| `test_callback_invocation_and_save` | Callback is invoked and KV cache is saved on request completion; interrupted requests skip saves |
+| `test_multi_model_smoke` | Two different models can each save/restore their KV cache without interference |
 | `test_cross_model_cache_isolation` | Two different models share a cache directory: no crash, LRU fallback |
 | `test_shared_cache_directory_two_models` | Two models save to the same dir: cache files from both coexist |
 | `test_restart_with_foreign_cache_files` | Server rebuilds from cache dir containing files from another model |
@@ -68,7 +68,16 @@ Integration tests in router mode, testing the combined pool across routes:
 
 | Test | Description |
 |------|-------------|
+| `test_kv_cache_initialization` | Server starts with KV cache auto enabled, disk manager initialized |
+| `test_first_request_save` | First request saves KV cache to disk |
+| `test_disk_lcp_wins_after_restart` | After restart (RAM empty), disk wins LCP selection |
+| `test_ram_cache_preferred` | RAM cache preferred over disk when similarity matches |
+| `test_both_caches_empty_lru_fallback` | Both caches empty, LRU slot is selected |
 | `test_combined_pool_lcp_match` | Combined pool routing with LCP across all 3 tiers |
+| `test_trie_rebuild_from_disk` | Restart server: trie rebuild from disk, cache HIT for same request |
+| `test_ttl_eviction` | Cache entries expire after TTL seconds |
+| `test_callback_invocation_and_save` | Callback invoked and KV cache saved on request completion |
+| `test_multi_model_smoke` | Two different models can each operate their own KV cache in router mode |
 
 ---
 

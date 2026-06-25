@@ -413,8 +413,6 @@ sequenceDiagram
 
 | File | Content |
 |---|---|
-| `kv-cache-auto-prompt.md` | Original design specification |
-| `kv-cache-auto-integration.md` | Integration guide (legacy 2-tier flow) |
+| `kv-cache-auto-prompt.md` | Design specification (3-tier unified pool, conditional save, eviction, file format, cross-model safety) |
 | `kv-cache-auto-similarity-sorting.md` | LCP computation and Radix Tree details |
-| `kv-cache-auto-final-plan.md` | Implementation reference with code snippets |
 | `kv-cache-auto-testing.md` | Testing guide and C++/Python tests |
