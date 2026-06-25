@@ -258,7 +258,7 @@ bool kv_cache_disk_manager::initialize(const std::string & cache_dir, float max_
             uint32_t n_token_count = *(uint32_t *) (header + 8);
 
             // Validate magic
-            if (magic != LLAMA_STATE_SEQ_MAGIC) {
+            if (magic != LLAMA_STATE_SEQ_MAGIC && magic != LLAMA_STATE_SEQ_MAGIC_COMPRESSED) {
                 LOG("KV cache rebuild: invalid magic in '%s', skipping\n", filepath.c_str());
                 continue;
             }
