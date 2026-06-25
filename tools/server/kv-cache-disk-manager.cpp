@@ -740,6 +740,21 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
 
     LOG("KV cache saved: slot=%d, size=%zu bytes, file='%s'\n", slot_id, bytes_written, filepath.c_str());
 
+    // Log compression stats after every save (not just at periodic intervals)
+    {
+        int64_t  comp_us = 0, decom_us = 0;
+        uint64_t unc_bytes = 0, com_bytes = 0, comp_n = 0, decom_n = 0;
+        llama_kv_cache_compression_stats_get(&comp_us, &decom_us, &unc_bytes, &com_bytes, &comp_n, &decom_n);
+        if (comp_n > 0 || decom_n > 0) {
+            const double ratio = com_bytes > 0 ? (double) unc_bytes / com_bytes : 0.0;
+            const double c_avg = comp_n > 0 ? (double) comp_us / comp_n / 1000.0 : 0.0;
+            const double d_avg = decom_n > 0 ? (double) decom_us / decom_n / 1000.0 : 0.0;
+            LOG("  compression: ratio=%.2fx unc=%" PRIu64 " comp=%" PRIu64 " enc=[n=%" PRIu64
+                " avg=%.1f]ms dec=[n=%" PRIu64 " avg=%.1f]ms\n",
+                ratio, unc_bytes, com_bytes, comp_n, c_avg, decom_n, d_avg);
+        }
+    }
+
     return true;
 }
 
