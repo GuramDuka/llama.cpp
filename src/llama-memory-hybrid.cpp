@@ -1,70 +1,71 @@
 #include "llama-memory-hybrid.h"
 
+#include "llama-context.h"
 #include "llama-impl.h"
 #include "llama-model.h"
-#include "llama-context.h"
 
 //
 // llama_memory_hybrid
 //
 
-llama_memory_hybrid::llama_memory_hybrid(
-        const llama_model & model,
-                            /* attn */
-                ggml_type   type_k,
-                ggml_type   type_v,
-                     bool   v_trans,
-                 uint32_t   kv_size,
-                 uint32_t   n_pad,
-                 uint32_t   n_swa,
-           llama_swa_type   swa_type,
-                            /* recurrent */
-                ggml_type   type_r,
-                ggml_type   type_s,
-                 uint32_t   rs_size,
-                            /* common */
-                 uint32_t   n_seq_max,
-                 uint32_t   n_rs_seq,
-                     bool   offload,
-                     bool   unified,
-                            /* layer filters */
-    const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+llama_memory_hybrid::llama_memory_hybrid(const llama_model &     model,
+                                         /* attn */
+                                         ggml_type               type_k,
+                                         ggml_type               type_v,
+                                         bool                    v_trans,
+                                         uint32_t                kv_size,
+                                         uint32_t                n_pad,
+                                         uint32_t                n_swa,
+                                         llama_swa_type          swa_type,
+                                         /* recurrent */
+                                         ggml_type               type_r,
+                                         ggml_type               type_s,
+                                         uint32_t                rs_size,
+                                         /* common */
+                                         uint32_t                n_seq_max,
+                                         uint32_t                n_rs_seq,
+                                         bool                    offload,
+                                         bool                    unified,
+                                         /* layer filters */
+                                         const layer_filter_cb & filter_attn,
+                                         const layer_filter_cb & filter_recr) :
     hparams(model.hparams),
-    mem_attn(new llama_kv_cache(
-        model,
-        model.hparams,
-        type_k,
-        type_v,
-        v_trans,
-        offload,
-        unified,
-        kv_size,
-        n_seq_max,
-        n_pad,
-        n_swa,
-        swa_type,
-        nullptr,
-        filter_attn == nullptr ?
-            [&](int32_t il) { return !hparams.is_recr(il); }
-            : filter_attn,
-        nullptr,
-        nullptr
-    )),
-    mem_recr(new llama_memory_recurrent(
-        model,
-        type_r,
-        type_s,
-        offload,
-        rs_size,
-        n_seq_max,
-        n_rs_seq,
-        filter_recr == nullptr ?
-            [&](int32_t il) { return hparams.is_recr(il); }
-            : filter_recr
-    )) {}
+    mem_attn(new llama_kv_cache(model,
+                                model.hparams,
+                                type_k,
+                                type_v,
+                                v_trans,
+                                offload,
+                                unified,
+                                kv_size,
+                                n_seq_max,
+                                n_pad,
+                                n_swa,
+                                swa_type,
+                                nullptr,
+                                filter_attn == nullptr ?
+                                    [&](int32_t il) {
+                                        return !hparams.is_recr(il);
+                                    } :
+                                    filter_attn,
+                                nullptr,
+                                nullptr)),
+    mem_recr(new llama_memory_recurrent(model,
+                                        type_r,
+                                        type_s,
+                                        offload,
+                                        rs_size,
+                                        n_seq_max,
+                                        n_rs_seq,
+                                        filter_recr == nullptr ?
+                                            [&](int32_t il) {
+                                                return hparams.is_recr(il);
+                                            } :
+                                            filter_recr)) {}
 
-llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
+llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc,
+                                                         uint32_t             n_ubatch,
+                                                         bool                 embd_all) {
     do {
         balloc.split_reset();
 
@@ -85,7 +86,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 } else {
                     // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
                     const bool unified = (mem_attn->get_n_stream() == 1);
-                    ubatch = balloc.split_equal(n_ubatch, !unified);
+                    ubatch             = balloc.split_equal(n_ubatch, !unified);
                 }
             }
 
@@ -93,7 +94,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 break;
             }
 
-            ubatches.push_back(std::move(ubatch)); // NOLINT
+            ubatches.push_back(std::move(ubatch));  // NOLINT
         }
 
         if (balloc.get_n_used() < balloc.get_n_tokens()) {
@@ -115,9 +116,8 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        return std::make_unique<llama_memory_hybrid_context>(
-                this, std::move(heads_attn), std::move(ubatches));
-    } while(false);
+        return std::make_unique<llama_memory_hybrid_context>(this, std::move(heads_attn), std::move(ubatches));
+    } while (false);
 
     return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
 }
@@ -142,11 +142,16 @@ void llama_memory_hybrid::clear(bool data) {
 
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Try removing from the recurrent cache first since it may fail. If it does
-    // fail, the cache will not have been mutated.
-    if (!mem_recr->seq_rm(seq_id, p0, p1)) {
-        return false;
-    }
-    return mem_attn->seq_rm(seq_id, p0, p1);
+    // fail (e.g. after L3 restore the rollback snapshots are empty), still
+    // clean the attention cache so the caller can proceed. The recurrent
+    // state will not be rolled back (one extra token contribution) but the
+    // caller only needs to re-evaluate one token for logits.
+    mem_recr->seq_rm(seq_id, p0, p1);
+
+    // Always clean the attention cache even when recurrent fails
+    mem_attn->seq_rm(seq_id, p0, p1);
+
+    return true;
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -214,28 +219,23 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_status sta
 llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem) :
     ctx_attn(mem->get_mem_attn()->init_full()),
     ctx_recr(mem->get_mem_recr()->init_full()),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
-}
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {}
 
-llama_memory_hybrid_context::llama_memory_hybrid_context(
-        llama_memory_hybrid * mem,
-              llama_context * lctx,
-                       bool   optimize) :
+llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * mem,
+                                                         llama_context *       lctx,
+                                                         bool                  optimize) :
     ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
     ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
-}
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {}
 
-llama_memory_hybrid_context::llama_memory_hybrid_context(
-              llama_memory_hybrid * mem,
-                  slot_info_vec_t   sinfos_attn,
-        std::vector<llama_ubatch>   ubatches) :
+llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid *     mem,
+                                                         slot_info_vec_t           sinfos_attn,
+                                                         std::vector<llama_ubatch> ubatches) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
     ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
-}
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {}
 
 bool llama_memory_hybrid_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
