@@ -3500,11 +3500,16 @@ struct server_context_impl {
                                     }
 
                                     if (do_reset) {
-                                        if (slot.prompt.checkpoints.empty()) {
+                                        if (slot.prompt.checkpoints.empty() &&
+                                            ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
                                             // Cache was populated externally (e.g. L2/L3 restore) and no
                                             // in-memory checkpoints exist yet. The data is valid — proceed
                                             // without forcing a full reprocess; checkpoints will be created
                                             // during normal processing.
+                                            // Only skip the reset for models that support partial seq_rm
+                                            // (PART/RS types). For FULL type (n_rs_seq = 0), recurrent memory
+                                            // can't remove a single tail position, so we must fall through
+                                            // to the full reprocess path.
                                             SLT_DBG(slot, "%s",
                                                     "cache populated externally, no in-memory checkpoints "
                                                     "needed\n");

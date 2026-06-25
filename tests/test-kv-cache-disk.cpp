@@ -1002,6 +1002,91 @@ int main(int argc, char ** argv) {
 #endif
 
     // -----------------------------------------------------------------------
+    // Test: restore + seq_rm (reproduces the crash after L3 restore when
+    //       n_past == n_tokens and the model can't do partial seq_rm)
+    // -----------------------------------------------------------------------
+    //
+    // The server's operator() does:
+    //   1. Restore KV cache from disk (L3)
+    //   2. n_past = n_tokens → n_past-- (TAG_PROMPT_LOGITS)
+    //   3. common_context_seq_rm(ctx_tgt, slot.id, p0, -1) to remove the last
+    //      token's position so it can be re-evaluated for logits.
+    //   4. For models with COMMON_CONTEXT_SEQ_RM_TYPE_PART or _RS this works.
+    //      For COMMON_CONTEXT_SEQ_RM_TYPE_FULL (recurrent n_rs_seq=0) it used
+    //      to abort. The server fix skips the n_past-- path for FULL type.
+    //
+    // This test verifies the whole chain: save → restore → seq_rm at the
+    // last cached position. For PART/RS models (e.g. attention-only) it always
+    // works; for FULL models the server avoids this path entirely.
+
+    t.test("restore_seq_rm", [&](testing & t) {
+        char filepath[512];
+        snprintf(filepath, sizeof(filepath), "%s/restore_seq_rm.bin", cache_dir);
+
+        // Context A: save KV cache with seq_id=0
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx                = 256;
+        auto ctx_a              = llama_context_ptr{ llama_init_from_model(model, cp) };
+
+        llama_batch batch_a = llama_batch_init((int) prompt_tok.size(), 0, 1);
+        for (int i = 0; i < (int) prompt_tok.size(); ++i) {
+            common_batch_add(batch_a, prompt_tok[i], i, { 0 }, true);
+        }
+        t.assert_true("decode should succeed", llama_decode(ctx_a.get(), batch_a) == 0);
+        llama_batch_free(batch_a);
+
+        size_t written = llama_state_seq_save_file(ctx_a.get(), filepath, 0, prompt_tok.data(), prompt_tok.size());
+        t.assert_true("save should produce data", written > 0);
+        ctx_a.reset();
+
+        // Context B: fresh context, load state (simulating L3 restore)
+        auto ctx_b = llama_context_ptr{ llama_init_from_model(model, cp) };
+
+        // Probe rm_type from a separate context so we don't clobber ctx_b's
+        // restored state (common_context_can_seq_rm clears all memory
+        // and decodes tokens internally).
+        const auto rm_type = [&]() {
+            auto probe = llama_context_ptr{ llama_init_from_model(model, cp) };
+            return common_context_can_seq_rm(probe.get());
+        }();
+
+        {
+            std::vector<int32_t> buf(prompt_tok.size());
+            size_t               n_out = 0;
+            size_t loaded = llama_state_seq_load_file(ctx_b.get(), filepath, 0, buf.data(), prompt_tok.size(), &n_out);
+            t.assert_true("restore with seq_id=0 should succeed", loaded > 0);
+            t.assert_true("restored token count matches", n_out == prompt_tok.size());
+        }
+
+        t.assert_true("model must support at least FULL seq_rm", rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                                                                     rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                                                                     rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+
+        // Get the minimum position in the restored cache (like the server does)
+        auto * mem     = llama_get_memory(ctx_b.get());
+        auto   pos_min = llama_memory_seq_pos_min(mem, 0);
+        auto   pos_max = llama_memory_seq_pos_max(mem, 0);
+        (void) pos_min;
+
+        // The restored cache should have positions [0..n_tokens-1]
+        t.assert_true("pos_max should be >= 0 after restore", pos_max >= 0);
+        t.assert_true("pos_max should be at n_tokens-1", (llama_pos) pos_max == (llama_pos) prompt_tok.size() - 1);
+
+        if (rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART || rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+            // Simulate the TAG_PROMPT_LOGITS path: remove the last position
+            // so it can be re-evaluated. This must not crash.
+            // For PART/RS models this always works.
+            common_context_seq_rm(ctx_b.get(), 0, (llama_pos) (prompt_tok.size() - 1), -1);
+
+            // After removal, pos_max should have changed
+            auto pos_max_after = llama_memory_seq_pos_max(mem, 0);
+            t.assert_true("pos_max should decrease after seq_rm", pos_max_after < pos_max || pos_max_after == -1);
+        }
+
+        std::filesystem::remove(filepath);
+    });
+
+    // -----------------------------------------------------------------------
     // Cleanup
     // -----------------------------------------------------------------------
 
