@@ -501,12 +501,13 @@ struct server_slot {
             }
 
             // Fork: Save to L2 (RAM) and L3 (disk) caches only on successful completion
+            // L2 (RAM) first so the "srv   prompt_save:" intent log precedes "KV cache saved" completion log
             if (completed_successfully) {
-                if (callback_save_kv_cache_to_disk) {
-                    callback_save_kv_cache_to_disk();
-                }
                 if (callback_save_kv_cache_to_ram) {
                     callback_save_kv_cache_to_ram();
+                }
+                if (callback_save_kv_cache_to_disk) {
+                    callback_save_kv_cache_to_disk();
                 }
             } else {
                 SLT_INF(*this, "%s", "request did not complete successfully, skipping cache save\n");
