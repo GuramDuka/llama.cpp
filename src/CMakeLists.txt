@@ -15,7 +15,10 @@ add_library(llama
             llama-arch.cpp
             llama-batch.cpp
             llama-chat.cpp
+            llama-compress-stats.cpp
             llama-context.cpp
+            llama-kv-dict.cpp
+            llama-zstd-io.cpp
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp
