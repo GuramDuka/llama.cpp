@@ -672,6 +672,12 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
         }
     }
 
+    // Snapshot compression stats before save to compute per-file delta
+    int64_t  comp_us_before = 0, decom_us_before = 0;
+    uint64_t unc_bytes_before = 0, com_bytes_before = 0, comp_n_before = 0, decom_n_before = 0;
+    llama_kv_cache_compression_stats_get(&comp_us_before, &decom_us_before, &unc_bytes_before, &com_bytes_before,
+                                         &comp_n_before, &decom_n_before);
+
     // Save KV cache state to file using llama_state_seq_save_file API
     // This ensures compatibility with llama_state_seq_load_file for restore
     size_t bytes_written = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot_id, tokens, token_count);
@@ -740,18 +746,28 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
 
     LOG("KV cache saved: slot=%d, size=%zu bytes, file='%s'\n", slot_id, bytes_written, filepath.c_str());
 
-    // Log compression stats after every save (not just at periodic intervals)
+    // Log per-file compression stats via delta from pre-save snapshot
     {
-        int64_t  comp_us = 0, decom_us = 0;
-        uint64_t unc_bytes = 0, com_bytes = 0, comp_n = 0, decom_n = 0;
-        llama_kv_cache_compression_stats_get(&comp_us, &decom_us, &unc_bytes, &com_bytes, &comp_n, &decom_n);
-        if (comp_n > 0 || decom_n > 0) {
-            const double ratio = com_bytes > 0 ? (double) unc_bytes / com_bytes : 0.0;
-            const double c_avg = comp_n > 0 ? (double) comp_us / comp_n / 1000.0 : 0.0;
-            const double d_avg = decom_n > 0 ? (double) decom_us / decom_n / 1000.0 : 0.0;
-            LOG("  compression: ratio=%.2fx unc=%" PRIu64 " comp=%" PRIu64 " enc=[n=%" PRIu64
-                " avg=%.1f]ms dec=[n=%" PRIu64 " avg=%.1f]ms\n",
-                ratio, unc_bytes, com_bytes, comp_n, c_avg, decom_n, d_avg);
+        int64_t  comp_us_after = 0, decom_us_after = 0;
+        uint64_t unc_bytes_after = 0, com_bytes_after = 0, comp_n_after = 0, decom_n_after = 0;
+        llama_kv_cache_compression_stats_get(&comp_us_after, &decom_us_after, &unc_bytes_after, &com_bytes_after,
+                                             &comp_n_after, &decom_n_after);
+
+        const uint64_t d_unc  = unc_bytes_after - unc_bytes_before;
+        const uint64_t d_com  = com_bytes_after - com_bytes_before;
+        const uint64_t d_comp = comp_n_after - comp_n_before;
+        const uint64_t d_deco = decom_n_after - decom_n_before;
+        const int64_t  d_cus  = comp_us_after - comp_us_before;
+        const int64_t  d_dus  = decom_us_after - decom_us_before;
+
+        if (d_comp > 0 || d_deco > 0) {
+            const double ratio    = d_com > 0 ? (double) d_unc / d_com : 0.0;
+            const double c_ms_avg = d_comp > 0 ? (double) d_cus / d_comp / 1000.0 : 0.0;
+            const double d_ms_avg = d_deco > 0 ? (double) d_dus / d_deco / 1000.0 : 0.0;
+            LOG("  file: slot=%d unc=%" PRIu64 " comp=%" PRIu64
+                " ratio=%.2fx"
+                " enc=[cnt=%" PRIu64 " avg=%.1f]ms dec=[cnt=%" PRIu64 " avg=%.1f]ms\n",
+                slot_id, d_unc, d_com, ratio, d_comp, c_ms_avg, d_deco, d_ms_avg);
         }
     }
 
