@@ -1744,11 +1744,9 @@ struct server_context_impl {
                                         ret   = &slot;
                                         l3_ok = true;
                                         SLT_INF(*ret, "restored slot from L3 disk cache '%s'\n", best.filepath.c_str());
-                                        if (prompt_cache) {
-                                            slot.prompt_save(*prompt_cache);
-                                            prompt_cache->update();
-                                            SLT_INF(*ret, "%s", "promoted L3 restore to L2 prompt cache\n");
-                                        }
+                                        // Do not promote to L2 here: the request has not been processed yet,
+                                        // and L2 save will happen naturally on slot release
+                                        // (callback_save_kv_cache_to_ram).
                                         break;
                                     }
                                 }

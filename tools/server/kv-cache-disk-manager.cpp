@@ -584,22 +584,23 @@ bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int3
     std::vector<llama_token> tokens(n_token_count);
     size_t                   n_token_count_out = 0;
 
-    // Try restoring with -1 (null seq_id) first
-    LOG("KV cache restore: attempting load with seq_id=-1, n_token_count=%u for file '%s'\n", n_token_count,
+    // Try restoring with the slot's seq_id first (matching how save_to_disk writes the file).
+    // This ensures the recurrent memory's seq_id-agnostic encoding gets assigned to the slot's seq_id.
+    LOG("KV cache restore: attempting load with slot_id=%d, n_token_count=%u for file '%s'\n", slot_id, n_token_count,
         filepath.c_str());
     size_t bytes_loaded =
-        llama_state_seq_load_file(ctx_tgt, filepath.c_str(), -1, tokens.data(), n_token_count, &n_token_count_out);
+        llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot_id, tokens.data(), n_token_count, &n_token_count_out);
 
     if (bytes_loaded == 0) {
-        LOG_WRN("KV cache restore: failed to load state from '%s' with seq_id=-1\n", filepath.c_str());
+        LOG_WRN("KV cache restore: failed to load state from '%s' with slot_id=%d\n", filepath.c_str(), slot_id);
 
-        // Try loading with specific slot_id as fallback
-        LOG("KV cache restore: trying with slot_id=%d as fallback\n", slot_id);
-        bytes_loaded = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot_id, tokens.data(), n_token_count,
-                                                 &n_token_count_out);
+        // Fallback: try -1 (null seq_id) for full cache restore
+        LOG("KV cache restore: trying with seq_id=-1 as fallback\n");
+        bytes_loaded =
+            llama_state_seq_load_file(ctx_tgt, filepath.c_str(), -1, tokens.data(), n_token_count, &n_token_count_out);
 
         if (bytes_loaded == 0) {
-            LOG_WRN("KV cache restore: failed to load state from '%s' with slot_id=%d\n", filepath.c_str(), slot_id);
+            LOG_WRN("KV cache restore: failed to load state from '%s' with seq_id=-1\n", filepath.c_str());
             return false;
         }
     }
