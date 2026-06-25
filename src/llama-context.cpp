@@ -3260,10 +3260,13 @@ size_t llama_context::state_seq_save_file(llama_seq_id        seq_id,
             }
         }
 
-        llama_io_write_zstd io(&file, level, dict_data, dict_size);
-        state_seq_write_data(io, seq_id, 0);
-
-        const size_t res = file.tell();
+        size_t res;
+        {
+            llama_io_write_zstd io(&file, level, dict_data, dict_size);
+            state_seq_write_data(io, seq_id, 0);
+        }
+        // Ensure io is destroyed (final zstd flush) before querying file size
+        res = file.tell();
         return res;
 #else
         LLAMA_LOG_ERROR("%s: KV cache compression requested but zstd not available\n", __func__);

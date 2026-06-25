@@ -851,6 +851,39 @@ int main(int argc, char ** argv) {
         std::filesystem::remove(cc_path);
     });
 
+    // Test: Returned bytes_written matches actual file size on disk.
+    // This guards against the bug where zstd buffered data is flushed
+    // after file.tell() is called, causing a mismatch.
+    t.test("compressed_save_size_matches_disk", [&](testing & t) {
+        char filepath[512];
+        snprintf(filepath, sizeof(filepath), "%s/size_match.bin", cache_dir);
+
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx                = 256;
+        cp.compress_kv_cache    = 3;
+        auto ctx_sm             = llama_context_ptr{ llama_init_from_model(model, cp) };
+
+        llama_batch batch_sm = llama_batch_init((int) prompt_tok.size(), 0, 1);
+        for (int i = 0; i < (int) prompt_tok.size(); ++i) {
+            common_batch_add(batch_sm, prompt_tok[i], i, { 0 }, true);
+        }
+        t.assert_true("decode", llama_decode(ctx_sm.get(), batch_sm) == 0);
+        llama_batch_free(batch_sm);
+
+        size_t written = llama_state_seq_save_file(ctx_sm.get(), filepath, 0, prompt_tok.data(), prompt_tok.size());
+        t.assert_true("save produces data", written > 0);
+
+        // Check actual file size on disk matches returned bytes_written
+        std::ifstream f(filepath, std::ios::binary | std::ios::ate);
+        t.assert_true("file exists", !!f);
+        size_t disk_size = (size_t) f.tellg();
+        f.close();
+
+        t.assert_true("size matches disk", written == disk_size);
+
+        std::filesystem::remove(filepath);
+    });
+
     // Test: Dictionary learning levels 0..3 all produce valid compressed files.
     // For levels>0, verify dict is embedded (version 3, dict_size > 0).
     // For level 0, verify no dict (version 2).
