@@ -1638,7 +1638,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx         = params.n_ctx;
     cparams.n_seq_max     = params.n_parallel;
-    cparams.n_rs_seq      = params.speculative.need_n_rs_seq();
+    // n_rs_seq defaults to 0 (no rollback snapshots) so that seq_rm always
+    // uses FULL mode. When n_rs_seq > 0, the rollback snapshot planes must be
+    // kept in sync across state save/restore (L3 disk), otherwise seq_rm reads
+    // garbage from zero-initialized snapshot slots after a restore.
+    cparams.n_rs_seq      = 0;
     cparams.n_outputs_max = std::max(params.n_outputs_max, 0);
     cparams.n_batch       = params.n_batch;
     cparams.n_ubatch      = params.n_ubatch;

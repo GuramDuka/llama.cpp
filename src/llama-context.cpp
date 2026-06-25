@@ -2625,11 +2625,13 @@ class llama_io_read_host : public llama_io_read_i {
   public:
     llama_io_read_host(const uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
 
-    ~llama_io_read_host() {
-        // flush the reads
+    ~llama_io_read_host() { flush(); }
+
+    void flush() override {
         for (const auto & rinfo : rinfos) {
             ggml_backend_tensor_set(rinfo.tensor, rinfo.ptr, rinfo.offset, rinfo.size);
         }
+        rinfos.clear();
     }
 
     void read(void * dst, size_t size) override {
@@ -2860,6 +2862,15 @@ class llama_io_read_device : public llama_io_read_i {
         mbufs(mbufs) {}
 
     ~llama_io_read_device() {
+        flush();
+        GGML_ASSERT(buf_size == 0);
+    }
+
+    void flush() override {
+        if (rinfos.empty()) {
+            return;
+        }
+
         llama_memory_buffers mbufs_new;
 
         for (const auto & rinfo : rinfos) {
@@ -2905,7 +2916,7 @@ class llama_io_read_device : public llama_io_read_i {
             }
         }
 
-        GGML_ASSERT(buf_size == 0);
+        rinfos.clear();
     }
 
     void read(void * dst, size_t size) override {

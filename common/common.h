@@ -369,14 +369,6 @@ struct common_params_speculative {
     common_params_speculative_ngram_cache ngram_cache;
 
     bool has_dft() const { return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty(); }
-
-    uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3;
-        });
-
-        return needs_rs_seq ? draft.n_max : 0u;
-    }
 };
 
 struct common_params_vocoder {

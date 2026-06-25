@@ -25,6 +25,12 @@ KV_TEST_MODELS = [
         "mradermacher/Qwen3.5-0.8B-i1-GGUF",
         "Qwen3.5-0.8B.i1-Q4_K_M.gguf",
     ),
+    # MTP model - hybrid recurrent with speculative decoding support
+    (
+        "Qwopus3.5-4B-Coder-MTP-Q5_K_M.gguf",
+        "Jackrong/Qwopus3.5-4B-Coder-MTP-GGUF",
+        "Qwopus3.5-4B-Coder-MTP-Q5_K_M.gguf",
+    ),
 ]
 
 # Model names used as preset section names
