@@ -591,7 +591,7 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
-    // Timestamp for freshness ordering in the combined 3-tier cache pool
+    // Fork: Timestamp for freshness ordering in the combined 3-tier cache pool
     int64_t created_us = 0;
 
     size_t size() const {
@@ -636,12 +636,6 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    // Struct for a prompt cache match with similarity score (used by combined 3-tier pool)
-    struct prompt_cache_match {
-        float   similarity;
-        int64_t timestamp_us;  // created_us for freshness comparison
-    };
-
     server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt &       prompt,
@@ -650,8 +644,13 @@ struct server_prompt_cache {
               llama_context *       ctx_drft,
               int32_t               id_slot);
 
-    // Find ALL matching prompt cache entries above threshold, with their similarity scores
+    // Fork: Find ALL matching prompt cache entries above threshold, with their similarity scores
     // Used by the combined 3-tier cache pool (L1=slots, L2=RAM, L3=disk)
+    struct prompt_cache_match {
+        float   similarity;
+        int64_t timestamp_us;  // created_us for freshness comparison
+    };
+
     std::vector<prompt_cache_match> find_all_matching(const server_tokens & tokens_new, float threshold) const;
 
     void update();

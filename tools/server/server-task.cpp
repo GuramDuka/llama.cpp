@@ -10,8 +10,6 @@
 #include "server-common.h"
 #include "speculative.h"
 
-#include <chrono>
-
 using json = nlohmann::ordered_json;
 
 //
@@ -1597,6 +1595,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         return nullptr;
     }
 
+    // Fork: capture timestamp for freshness ordering in 3-tier pool
     auto now_us =
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch())
             .count();
@@ -1616,6 +1615,7 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     return &states.back();
 }
 
+// Fork: Find all matching prompt cache entries above threshold
 std::vector<server_prompt_cache::prompt_cache_match> server_prompt_cache::find_all_matching(
     const server_tokens & tokens_new,
     float                 threshold) const {
