@@ -3500,13 +3500,24 @@ struct server_context_impl {
                                     }
 
                                     if (do_reset) {
-                                        SLT_WRN(
-                                            slot,
-                                            "forcing full prompt re-processing due to lack of cache data (likely due "
-                                            "to SWA or hybrid/recurrent memory, see %s)\n",
-                                            "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        pos_next = 0;
-                                        n_past   = 0;
+                                        if (slot.prompt.checkpoints.empty()) {
+                                            // Cache was populated externally (e.g. L2/L3 restore) and no
+                                            // in-memory checkpoints exist yet. The data is valid — proceed
+                                            // without forcing a full reprocess; checkpoints will be created
+                                            // during normal processing.
+                                            SLT_DBG(slot, "%s",
+                                                    "cache populated externally, no in-memory checkpoints "
+                                                    "needed\n");
+                                        } else {
+                                            SLT_WRN(slot,
+                                                    "forcing full prompt re-processing due to lack of cache data "
+                                                    "(likely due "
+                                                    "to SWA or hybrid/recurrent memory, see %s)\n",
+                                                    "https://github.com/ggml-org/llama.cpp/pull/"
+                                                    "13194#issuecomment-2868343055");
+                                            pos_next = 0;
+                                            n_past   = 0;
+                                        }
                                     }
                                 }
                             }
