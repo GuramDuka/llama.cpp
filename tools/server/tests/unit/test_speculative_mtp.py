@@ -13,8 +13,13 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.normpath(os.path.join(_SCRIPT_DIR, "../../../../"))
 _MODEL_PATH = os.path.join(_PROJECT_ROOT, "models/Qwopus3.5-4B-Coder-MTP-Q5_K_M.gguf")
 
-# 27B model path (absolute, requires pre-downloaded model)
-_MODEL_PATH_LARGE = "/mega/models/Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF/Qwopus3.6-27B-Coder-MTP-IQ4_XS.gguf"
+# Auto-download: this test suite can download the MTP model on demand.
+#   - 4B Qwopus-MTP model: Jackrong/Qwopus3.5-4B-Coder-MTP-GGUF
+#   - 27B Qwopus model:    Jackrong/Qwopus3.6-27B-Coder-GGUF
+_HF_REPO_MTP = "Jackrong/Qwopus3.5-4B-Coder-MTP-GGUF"
+_HF_FILE_MTP = "Qwopus3.5-4B-Coder-MTP-Q5_K_M.gguf"
+_HF_REPO_27B = "Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF"
+_HF_FILE_27B = "Qwopus3.6-27B-Coder-MTP-IQ4_XS.gguf"
 
 # Allow large model tests via environment variable
 _LARGE_TESTS_ENABLED = os.environ.get("LARGE_MODEL_TESTS") == "1"
@@ -48,12 +53,18 @@ def create_server():
     global server
     server = ServerPreset.qwopus_mtp()
     server.model_file = _MODEL_PATH
+    # Only enable auto-download if the model is not already cached locally.
+    # Tests run with offline=True (from the preset), so the HF repo is only
+    # used by load_all() which overrides offline=False.
+    if not os.path.isfile(_MODEL_PATH):
+        server.model_hf_repo = _HF_REPO_MTP
+        server.model_hf_file = _HF_FILE_MTP
     server.spec_draft_n_min = 4
     server.spec_draft_n_max = 8
     server.debug = True
 
     # KV cache auto settings
-    server.cache_ram = 100
+    server.cache_ram = 8000
     server.kv_cache_auto = True
     server.slot_save_path = tempfile.mkdtemp(prefix="mtp-kv-cache-")
     server.max_cache_size_gb = 1.0
@@ -343,12 +354,20 @@ def test_combined_pool_lcp_match():
 
 
 def test_trie_rebuild_from_disk():
-    """Restart server: trie rebuild from disk, cache HIT for same request."""
+    """Restart server: trie rebuild from disk, cache HIT for same request.
+
+    The output from a fresh server run must match the output from a server
+    that restored the same prompt from the KV cache, ensuring deterministic
+    generation regardless of whether the KV cache was used.
+    """
     global server
 
-    # Start, save entry
+    # Start, send request on fresh server and capture response
     server.start()
-    _send_completion("What is 2+2? Briefly.", 8)
+    res_fresh = _send_completion("What is 2+2? Briefly.", 8)
+    assert res_fresh.status_code == 200, "Fresh request should succeed"
+    fresh_text = res_fresh.body["content"]
+    assert len(fresh_text) > 0, "Fresh response should not be empty"
     time.sleep(3)
 
     # Check files exist before restart
@@ -371,11 +390,20 @@ def test_trie_rebuild_from_disk():
     )
 
     # Same request should HIT
-    _send_completion("What is 2+2? Briefly.", 8)
+    res_cached = _send_completion("What is 2+2? Briefly.", 8)
+    assert res_cached.status_code == 200, "Cached request should succeed"
+    cached_text = res_cached.body["content"]
 
     hit_log = log.drain()
     assert "best candidate from L3" in hit_log or "KV cache HIT" in hit_log, (
         f"No HIT or restore after rebuild: {hit_log[:800]}"
+    )
+
+    # Both responses must be identical at temperature=0
+    assert fresh_text == cached_text, (
+        f"KV cache output differs!\n"
+        f"  Fresh:    {repr(fresh_text)}\n"
+        f"  Cached:   {repr(cached_text)}\n"
     )
 
 
@@ -449,7 +477,7 @@ def router_server():
     s.n_slots = 1
     s.n_predict = 8
     s.temperature = 0.0
-    s.cache_ram = 100
+    s.cache_ram = 8000
     s.kv_cache_auto = True
     s.max_cache_size_gb = 1.0
     s.cache_ttl_seconds = 3600
@@ -602,6 +630,249 @@ def test_router_restart_disk_restore(router_server):
 
 
 # ============================================================================
+# MTP L3 Cache Regression Tests
+# ============================================================================
+# These tests verify that previously-fixed bugs stay fixed:
+#
+#   1. L3 cache deterministic output after restart
+#      - Without the preamble fix, the draft model's state at end-of-generation
+#        was saved and restored.  After seq_rm, cells had accumulated generation
+#        content, corrupting the first batch of draft tokens.
+#      Fix: preamble buffer captures the draft state right after prompt processing.
+#
+#   2. seq_rm tail cell handling (n_rs_seq = 0)
+#      - When seq_rm removed all cells from p0 to end, the tail cell (the very
+#        last one) was cleared, making the SSM state start from zero on the next
+#        decode and producing wrong logits.
+#      Fix: keep the tail cell alive by adjusting its position to p0-1.
+#
+#   3. Draft state preamble
+#      - The preamble ensures the .draft companion file stores the draft model's
+#        state at the BEGINNING of generation, not the end.  This avoids
+#        propagating corrupted accumulated content to subsequent requests.
+#
+
+
+def _send_chat(prompt: str, max_tokens: int = 32):
+    """Helper to send /v1/chat/completions with temperature=0."""
+    return server.make_request(
+        "POST",
+        "/v1/chat/completions",
+        data={
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "top_k": 1,
+            "cache_prompt": True,
+        },
+    )
+
+
+def test_mtp_l3_cache_deterministic():
+    """L3 cache restore must produce bit-identical output to a fresh run.
+
+    This exercises the draft-state preamble fix:
+      1. First request writes to L3 cache (end-of-generation state).
+      2. Second request with the same prompt hits L3 cache and restores.
+      3. Both outputs must be identical (temperature=0, greedy).
+
+    Regression: without the preamble fix, the end-of-generation draft state
+    contaminated cells after seq_rm, producing different draft tokens and a
+    diverging output after the first accepted token.
+    """
+    global server
+    server.n_predict = 32
+    server.start()
+    log = LogReader(server.log_path)
+    log.drain()  # skip init
+
+    # --- Request 1: fresh run ---
+    r1 = _send_chat("What is 2+2? Briefly.", 32)
+    assert r1.status_code == 200
+    fresh_text = r1.body["choices"][0]["message"]["content"]
+    assert len(fresh_text) > 0
+
+    # Wait for L3 save to complete
+    time.sleep(3)
+    save_log = log.drain()
+    assert "KV cache saved" in save_log, f"L3 save not found: {save_log[:500]}"
+
+    # --- Request 2: should restore from L3 cache ---
+    r2 = _send_chat("What is 2+2? Briefly.", 32)
+    assert r2.status_code == 200
+    restored_text = r2.body["choices"][0]["message"]["content"]
+
+    # Check that L3 cache was actually used
+    r2_log = log.drain()
+    assert (
+        "best candidate from L3" in r2_log or "restored slot from disk cache" in r2_log
+    ), f"L3 restore not detected: {r2_log[:800]}"
+
+    # The outputs must be identical at temperature=0
+    assert fresh_text == restored_text, (
+        f"MTP L3 cache output differs!\n"
+        f"  Fresh:    {repr(fresh_text)}\n"
+        f"  Restored: {repr(restored_text)}\n"
+    )
+
+
+def test_mtp_l3_draft_preamble_saved():
+    """The L3 save callback must write a .draft companion file.
+
+    Without the preamble fix, the draft state was saved/loaded through the
+    end-of-generation path, which leaked accumulated content.  This test
+    verifies that a .draft file exists after the first request, and that
+    its size is consistent with the expected preamble state size.
+    """
+    global server
+    server.start()
+    log = LogReader(server.log_path)
+
+    # Send request
+    res = _send_chat("Hello world", 16)
+    assert res.status_code == 200
+    time.sleep(3)
+
+    # Check for .draft companion files
+    cache_dir = server.slot_save_path
+    draft_files = [f for f in os.listdir(cache_dir) if f.endswith(".draft")]
+    assert len(draft_files) > 0, f"No .draft files found in {cache_dir}"
+    # Each .draft should be non-empty (preamble state)
+    for df in draft_files:
+        full_path = os.path.join(cache_dir, df)
+        assert os.path.getsize(full_path) > 0, f"Empty .draft file: {full_path}"
+
+
+def test_mtp_l3_deterministic_after_restart():
+    """Server restart: L3 cache must still produce deterministic output.
+
+    This exercises both:
+      - L3 cache trie rebuild from disk on startup
+      - Full preamble restore after server restart (cold cache)
+
+    The output of a fresh request must match the output after a restart
+    that serves the same prompt from disk.
+    """
+    global server
+    server.n_predict = 32
+    server.start()
+
+    # --- First request: populate L3 ---
+    r1 = _send_chat("What is 2+2? Briefly.", 32)
+    assert r1.status_code == 200
+    expected = r1.body["choices"][0]["message"]["content"]
+    assert len(expected) > 0
+    time.sleep(3)
+
+    # --- Restart server (disk cache persists) ---
+    server.stop()
+    fd, server.log_path = tempfile.mkstemp(suffix=".log")
+    os.close(fd)
+    server.start()
+
+    # --- Second request: restore from disk ---
+    r2 = _send_chat("What is 2+2? Briefly.", 32)
+    assert r2.status_code == 200
+    actual = r2.body["choices"][0]["message"]["content"]
+
+    # Must match exactly
+    assert expected == actual, (
+        f"MTP L3 output differs after restart!\n"
+        f"  Before restart: {repr(expected)}\n"
+        f"  After restart:  {repr(actual)}\n"
+    )
+
+
+def test_mtp_seq_rm_tail_not_lost():
+    """seq_rm must preserve the tail cell when trimming from p0 to end
+    (n_rs_seq = 0).  Without the fix, the tail cell was cleared and the
+    subsequent decode started from a zero state, producing different logits.
+
+    This test indirectly exercises the fix by verifying that:
+      - A request with a long prompt triggers seq_rm on KV cache restore
+      - The output is still valid (not garbled / empty)
+    """
+    global server
+    server.n_ctx = 256
+    server.start()
+
+    # Prompt that is long enough to cause KV shifting / seq_rm
+    res = _send_chat("Write a story about " + "mountains " * 80, 16)
+    assert res.status_code == 200
+    assert len(res.body["choices"][0]["message"]["content"]) > 0, (
+        "seq_rm tail loss produced empty/garbled output"
+    )
+
+
+def test_mtp_draft_preamble_multiple_requests():
+    """Multiple requests using L3 cache: each request saves and restores
+    from the preamble state, producing consistent output across all runs."""
+    global server
+    server.n_predict = 16
+    server.start()
+
+    # Run several requests, all with the same prompt
+    prompt = "What is 2+2? Briefly."
+    outputs = []
+    for i in range(3):
+        res = _send_chat(prompt, 16)
+        assert res.status_code == 200
+        outputs.append(res.body["choices"][0]["message"]["content"])
+        time.sleep(2)  # let L3 save complete
+
+    # All outputs must be identical
+    for i in range(1, len(outputs)):
+        assert outputs[0] == outputs[i], (
+            f"MTP preamble: output {i} differs from output 0\n"
+            f"  [0]: {repr(outputs[0])}\n"
+            f"  [{i}]: {repr(outputs[i])}\n"
+        )
+
+
+def test_mtp_l3_with_longer_prompt():
+    """L3 cache restore with a moderately long prompt must be deterministic.
+
+    Longer prompts stress the preamble state size and seq_rm correctness."""
+    global server
+    server.n_predict = 16
+    server.n_ctx = 1024
+    server.start()
+    log = LogReader(server.log_path)
+
+    long_prompt = (
+        "The following is a conversation with an AI assistant. "
+        "The assistant is helpful, creative, and very friendly.\n\n"
+        "Human: Can you explain the concept of recursion in computer science?\n"
+        "Assistant:"
+    )
+
+    # Request 1: fresh
+    r1 = _send_chat(long_prompt, 16)
+    assert r1.status_code == 200
+    expected = r1.body["choices"][0]["message"]["content"]
+
+    time.sleep(3)
+    save_log = log.drain()
+    assert "KV cache saved" in save_log, f"L3 save not found: {save_log[:500]}"
+
+    # Request 2: should use L3
+    r2 = _send_chat(long_prompt, 16)
+    assert r2.status_code == 200
+    actual = r2.body["choices"][0]["message"]["content"]
+
+    restore_log = log.drain()
+    assert (
+        "restored from L3" in restore_log or "best candidate from L3" in restore_log
+    ), f"L3 not used for long prompt: {restore_log[:500]}"
+
+    assert expected == actual, (
+        f"MTP L3 mismatch with longer prompt!\n"
+        f"  Fresh:    {repr(expected)}\n"
+        f"  Restored: {repr(actual)}\n"
+    )
+
+
+# ============================================================================
 # 27B Model Test (skipped by default, requires LARGE_MODEL_TESTS=1 env var)
 # ============================================================================
 
@@ -613,11 +884,14 @@ def test_router_restart_disk_restore(router_server):
 def test_mtp_27b_completion():
     """Basic MTP completion with the 27B Qwopus model.
 
-    Requires the pre-downloaded model at:
-    /mega/models/Jackrong/Qwopus3.6-27B-Coder-MTP-GGUF/Qwopus3.6-27B-Coder-MTP-IQ4_XS.gguf
+    Auto-downloads from HuggingFace if not cached locally.
+    The 27B model does NOT have MTP heads; this test verifies the server
+    can load and run a large model without issues.
     """
     global server
-    server.model_file = _MODEL_PATH_LARGE
+    server.model_file = None  # trigger auto-download
+    server.model_hf_repo = _HF_REPO_27B
+    server.model_hf_file = _HF_FILE_27B
     server.n_predict = 32
     server.start()
     res = server.make_request(

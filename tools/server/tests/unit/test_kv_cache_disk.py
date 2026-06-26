@@ -65,7 +65,7 @@ def create_server():
     server.n_slots = 1
     server.n_predict = 8
     server.temperature = 0.0
-    server.cache_ram = 100
+    server.cache_ram = 8000
     server.kv_cache_auto = True
     server.slot_save_path = tempfile.mkdtemp(prefix="kv-cache-test-")
     server.max_cache_size_gb = 1.0
@@ -277,12 +277,20 @@ def test_combined_pool_lcp_match():
 
 
 def test_trie_rebuild_from_disk():
-    """Restart server: trie rebuild from disk, cache HIT for same request."""
+    """Restart server: trie rebuild from disk, cache HIT for same request.
+
+    The output from a fresh server run must match the output from a server
+    that restored the same prompt from the KV cache, ensuring deterministic
+    generation regardless of whether the KV cache was used.
+    """
     global server
 
-    # Start, save entry
+    # Start, send request on fresh server and capture response
     server.start()
-    _send_completion("What is 2+2? Briefly.", 8)
+    res_fresh = _send_completion("What is 2+2? Briefly.", 8)
+    assert res_fresh.status_code == 200, "Fresh request should succeed"
+    fresh_text = res_fresh.body["content"]
+    assert len(fresh_text) > 0, "Fresh response should not be empty"
     time.sleep(3)
 
     # Check files exist before restart
@@ -305,12 +313,21 @@ def test_trie_rebuild_from_disk():
     )
 
     # Same request should HIT
-    _send_completion("What is 2+2? Briefly.", 8)
+    res_cached = _send_completion("What is 2+2? Briefly.", 8)
+    assert res_cached.status_code == 200, "Cached request should succeed"
+    cached_text = res_cached.body["content"]
 
     hit_log = log.drain()
     assert "KV cache HIT" in hit_log, f"No HIT after rebuild: {hit_log[:800]}"
     assert "restored slot from disk cache" in hit_log, (
         f"No restore after rebuild: {hit_log[:800]}"
+    )
+
+    # Both responses must be identical at temperature=0
+    assert fresh_text == cached_text, (
+        f"KV cache output differs!\n"
+        f"  Fresh:    {repr(fresh_text)}\n"
+        f"  Cached:   {repr(cached_text)}\n"
     )
 
 
