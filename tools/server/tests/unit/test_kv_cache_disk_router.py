@@ -84,6 +84,7 @@ def create_server():
     server.n_predict = 8
     server.temperature = 0.0
     server.cache_ram = 8000
+    server.n_threads = 16
     server.kv_cache_auto = True
     server.max_cache_size_gb = 1.0
     server.cache_ttl_seconds = 3600
@@ -454,6 +455,7 @@ def test_multi_model_smoke():
         s.n_predict = 8
         s.temperature = 0.0
         s.cache_ram = 8000
+        s.n_threads = 16
         s.kv_cache_auto = True
         s.max_cache_size_gb = 1.0
         s.cache_ttl_seconds = 3600

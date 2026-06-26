@@ -66,6 +66,7 @@ def create_server():
     server.n_predict = 8
     server.temperature = 0.0
     server.cache_ram = 8000
+    server.n_threads = 16
     server.kv_cache_auto = True
     server.slot_save_path = tempfile.mkdtemp(prefix="kv-cache-test-")
     server.max_cache_size_gb = 1.0
@@ -407,6 +408,7 @@ def test_multi_model_smoke():
         s.model_hf_file = None
         s.offline = True
         s.kv_cache_auto = True
+        s.n_threads = 16
         s.slot_save_path = cache_dir
         s.max_cache_size_gb = 1.0
         s.cache_ttl_seconds = 3600
@@ -537,6 +539,7 @@ def test_cross_model_cache_isolation():
     s_b.model_hf_file = None
     s_b.offline = True
     s_b.kv_cache_auto = True
+    s_b.n_threads = 16
     s_b.slot_save_path = cache_dir
     s_b.max_cache_size_gb = 1.0
     s_b.cache_ttl_seconds = 3600
@@ -636,6 +639,7 @@ def test_shared_cache_directory_two_models():
     s2.model_hf_file = None
     s2.offline = True
     s2.kv_cache_auto = True
+    s2.n_threads = 16
     s2.slot_save_path = cache_dir
     s2.max_cache_size_gb = 1.0
     s2.cache_ttl_seconds = 3600
@@ -725,6 +729,7 @@ def test_restart_with_foreign_cache_files():
     s2.model_hf_file = None
     s2.offline = True
     s2.kv_cache_auto = True
+    s2.n_threads = 16
     s2.slot_save_path = cache_dir
     s2.max_cache_size_gb = 1.0
     s2.cache_ttl_seconds = 3600

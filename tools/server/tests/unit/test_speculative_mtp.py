@@ -65,6 +65,7 @@ def create_server():
 
     # KV cache auto settings
     server.cache_ram = 8000
+    server.n_threads = 16
     server.kv_cache_auto = True
     server.slot_save_path = tempfile.mkdtemp(prefix="mtp-kv-cache-")
     server.max_cache_size_gb = 1.0
@@ -478,6 +479,7 @@ def router_server():
     s.n_predict = 8
     s.temperature = 0.0
     s.cache_ram = 8000
+    s.n_threads = 16
     s.kv_cache_auto = True
     s.max_cache_size_gb = 1.0
     s.cache_ttl_seconds = 3600
