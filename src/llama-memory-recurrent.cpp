@@ -192,7 +192,8 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     cell.pos = p0 - 1;
                     return true;
                 }
-                return false;
+                // rollback not possible (n_rs_seq == 0 or rollback > n_rs_seq),
+                // fall through to normal cell clearing below
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
