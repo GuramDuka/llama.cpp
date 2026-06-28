@@ -754,10 +754,34 @@ def test_mtp_l3_deterministic_after_restart():
 
     The output of a fresh request must match the output after a restart
     that serves the same prompt from disk.
+
+    Uses the 27B model for thorough testing.
     """
     global server
+    server.model_file = os.path.join(
+        _PROJECT_ROOT, "models/Qwopus3.6-27B-Coder-MTP-IQ4_XS.gguf"
+    )
     server.n_predict = 32
+    server.jinja = True
+    server.reasoning = "off"
+
+    # --- Cleanup: ensure cache directory is empty before test ---
+    cache_dir = _cache_dir(server.slot_save_path)
+    if os.path.isdir(cache_dir):
+        for fname in os.listdir(cache_dir):
+            fpath = os.path.join(cache_dir, fname)
+            if os.path.isfile(fpath):
+                os.unlink(fpath)
+            elif os.path.isdir(fpath):
+                shutil.rmtree(fpath, ignore_errors=True)
+
     server.start()
+
+    # --- Debug: check cache dir before first request ---
+    if os.path.isdir(cache_dir):
+        print(f"[DEBUG] Cache dir before first request: {os.listdir(cache_dir)}")
+    else:
+        print(f"[DEBUG] Cache dir does not exist: {cache_dir}")
 
     # --- First request: populate L3 ---
     r1 = _send_chat("What is 2+2? Briefly.", 32)
@@ -766,16 +790,57 @@ def test_mtp_l3_deterministic_after_restart():
     assert len(expected) > 0
     time.sleep(3)
 
+    # --- Debug: check cache dir after first request ---
+    if os.path.isdir(cache_dir):
+        print(f"[DEBUG] Cache dir after first request: {os.listdir(cache_dir)}")
+        for fname in os.listdir(cache_dir):
+            fpath = os.path.join(cache_dir, fname)
+            if os.path.isfile(fpath):
+                print(f"[DEBUG]   File: {fname}, size: {os.path.getsize(fpath)}")
+            elif os.path.isdir(fpath):
+                print(f"[DEBUG]   Dir: {fname}")
+    else:
+        print(f"[DEBUG] Cache dir does not exist after first request: {cache_dir}")
+
+    # --- Debug: read server log ---
+    log_before = ""
+    if os.path.exists(server.log_path):
+        with open(server.log_path, encoding="utf-8", errors="replace") as f:
+            log_before = f.read()
+    print(f"[DEBUG] Log before restart (last 3000 chars): {log_before[-3000:]}")
+
     # --- Restart server (disk cache persists) ---
     server.stop()
     fd, server.log_path = tempfile.mkstemp(suffix=".log")
     os.close(fd)
+
+    # --- Debug: check cache dir before restart ---
+    if os.path.isdir(cache_dir):
+        print(f"[DEBUG] Cache dir before restart: {os.listdir(cache_dir)}")
+    else:
+        print(f"[DEBUG] Cache dir does not exist before restart: {cache_dir}")
+
     server.start()
+
+    # --- Debug: read server log after restart ---
+    time.sleep(1)
+    log_after = ""
+    if os.path.exists(server.log_path):
+        with open(server.log_path, encoding="utf-8", errors="replace") as f:
+            log_after = f.read()
+    print(f"[DEBUG] Log after restart (last 3000 chars): {log_after[-3000:]}")
 
     # --- Second request: restore from disk ---
     r2 = _send_chat("What is 2+2? Briefly.", 32)
     assert r2.status_code == 200
     actual = r2.body["choices"][0]["message"]["content"]
+
+    # --- Debug: read server log after second request ---
+    log_after2 = ""
+    if os.path.exists(server.log_path):
+        with open(server.log_path, encoding="utf-8", errors="replace") as f:
+            log_after2 = f.read()
+    print(f"[DEBUG] Log after second request (last 5000 chars): {log_after2[-5000:]}")
 
     # Must match exactly
     assert expected == actual, (

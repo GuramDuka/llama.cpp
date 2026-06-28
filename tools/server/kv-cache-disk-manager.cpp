@@ -242,6 +242,11 @@ bool kv_cache_disk_manager::initialize(const std::string & cache_dir, float max_
 
             std::string filepath = file_entry.path().string();
 
+            // Skip .draft companion files (they are managed by their main file entry)
+            if (filepath.size() > 6 && filepath.substr(filepath.size() - 6) == ".draft") {
+                continue;
+            }
+
             // Read file header (magic 4 + version 4 + n_token_count 4 = 12 bytes)
             std::ifstream file(filepath, std::ios::binary);
             if (!file) {
@@ -536,7 +541,10 @@ std::string kv_cache_disk_manager::find_cache_entry(const llama_tokens & tokens,
 }
 
 // Restore KV cache state from disk file to slot context
-bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int32_t slot_id, llama_context * ctx_tgt) {
+bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath,
+                                              int32_t             slot_id,
+                                              llama_context *     ctx_tgt,
+                                              llama_context *     ctx_dft) {
     if (!ctx_tgt || filepath.empty()) {
         LOG_WRN("KV cache restore: invalid parameters\n");
         return false;
@@ -610,11 +618,30 @@ bool kv_cache_disk_manager::restore_from_disk(const std::string & filepath, int3
         return false;
     }
 
-    LOG("KV cache restored: slot=%d, file='%s', bytes=%zu\n", slot_id, filepath.c_str(), bytes_loaded);
+    // Restore draft model state from companion file (if draft context and draft file exist)
+    size_t draft_bytes_loaded = 0;
+    if (ctx_dft) {
+        std::string draft_filepath = filepath + ".draft";
+        if (std::filesystem::exists(draft_filepath)) {
+            LOG("KV cache restore: restoring draft state from '%s'\n", draft_filepath.c_str());
+            draft_bytes_loaded = llama_state_seq_load_file(ctx_dft, draft_filepath.c_str(), slot_id, tokens.data(),
+                                                           n_token_count, &n_token_count_out);
+            if (draft_bytes_loaded == 0) {
+                LOG_WRN("KV cache restore: failed to restore draft from '%s', continuing without draft\n",
+                        draft_filepath.c_str());
+            }
+        } else {
+            LOG("KV cache restore: no draft companion file '%s' found, continuing without draft\n",
+                draft_filepath.c_str());
+        }
+    }
+
+    LOG("KV cache restored: slot=%d, file='%s', bytes=%zu, draft=%zu\n", slot_id, filepath.c_str(), bytes_loaded,
+        draft_bytes_loaded);
 
     // Update metrics
     metrics_.restores_completed++;
-    metrics_.total_restore_bytes += bytes_loaded;
+    metrics_.total_restore_bytes += bytes_loaded + draft_bytes_loaded;
 
     return true;
 }
@@ -637,14 +664,13 @@ float kv_cache_disk_manager::get_disk_lcp(const std::string & filepath, const st
     return calculate_lcp_ratio(lru_ring_[it->second].metadata.tokens, tokens);
 }
 
-bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
-                                         llama_context * ctx_tgt,
-                                         llama_context * ctx_dft,
-                                         const int32_t * tokens,
-                                         size_t          token_count) {
+bool kv_cache_disk_manager::save_to_disk(int32_t                    slot_id,
+                                         llama_context *            ctx_tgt,
+                                         llama_context *            ctx_dft,
+                                         const int32_t *            tokens,
+                                         size_t                     token_count,
+                                         const std::vector<float> * pending_h) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    (void) ctx_dft;  // Reserved for future use (e.g., dual-context save)
 
     if (!ctx_tgt) {
         LOG_WRN("KV cache save: no target context\n");
@@ -659,12 +685,13 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
     int64_t timestamp_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
 
     // Generate filename
-    std::string filename = generate_cache_filename(slot_id, timestamp_us);
-    std::string filepath = cache_dir_ + filename;
+    std::string filename       = generate_cache_filename(slot_id, timestamp_us);
+    std::string filepath       = cache_dir_ + filename;
+    std::string draft_filepath = filepath + ".draft";
 
-    // Check if we need to evict before saving
+    // Check if we need to evict before saving (account for both target + draft files)
     if (max_size_bytes_ > 0) {
-        while (current_size_bytes_ + 1024 * 1024 > max_size_bytes_) {
+        while (current_size_bytes_ + 2 * 1024 * 1024 > max_size_bytes_) {
             if (!evict_lru_entry()) {
                 LOG_WRN("KV cache save: cannot evict, skipping save\n");
                 return false;
@@ -702,12 +729,41 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
         }
     }
 
+    // Save draft model state to companion file (if draft context exists)
+    size_t draft_bytes_written = 0;
+    if (ctx_dft) {
+        LOG("KV cache save: saving draft state to '%s'\n", draft_filepath.c_str());
+        draft_bytes_written = llama_state_seq_save_file(ctx_dft, draft_filepath.c_str(), slot_id, tokens, token_count);
+        if (draft_bytes_written == 0) {
+            LOG_WRN("KV cache save: failed to save draft state to '%s', continuing without draft\n",
+                    draft_filepath.c_str());
+        }
+    }
+
+    // Save MTP pending_h embedding to sidecar file (if provided)
+    if (pending_h && !pending_h->empty()) {
+        const std::string pending_filepath = filepath + ".pending";
+        FILE *            pending_fp       = fopen(pending_filepath.c_str(), "wb");
+        if (pending_fp) {
+            const size_t n_floats      = pending_h->size();
+            size_t       items_written = fwrite(pending_h->data(), sizeof(float), n_floats, pending_fp);
+            fclose(pending_fp);
+            if (items_written != n_floats) {
+                LOG_WRN("KV cache save: failed to write pending_h to '%s' (%zu/%zu)\n", pending_filepath.c_str(),
+                        items_written, n_floats);
+                remove(pending_filepath.c_str());
+            } else {
+                LOG("KV cache save: saved pending_h (%zu floats) to '%s'\n", n_floats, pending_filepath.c_str());
+            }
+        }
+    }
+
     // Update metadata
     disk_cache_entry entry;
     entry.filepath         = filepath;
     entry.created_at_us    = timestamp_us;
     entry.last_accessed_us = timestamp_us;
-    entry.file_size_bytes  = bytes_written;
+    entry.file_size_bytes  = bytes_written + draft_bytes_written;
     entry.seq_id           = slot_id;
 
     // Store token sequence for LCP matching (limit to MAX_TOKENS)
@@ -732,7 +788,7 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
         trie_->insert(entry.tokens, lru_ring_.size() - 1);
     }
 
-    current_size_bytes_ += bytes_written;
+    current_size_bytes_ += bytes_written + draft_bytes_written;
     metrics_.saves_completed++;
 
     // Log trie statistics periodically (every 10 saves)
@@ -744,7 +800,8 @@ bool kv_cache_disk_manager::save_to_disk(int32_t         slot_id,
             trie_stats.max_depth, trie_stats.root_branches);
     }
 
-    LOG("KV cache saved: slot=%d, size=%zu bytes, file='%s'\n", slot_id, bytes_written, filepath.c_str());
+    LOG("KV cache saved: slot=%d, size=%zu bytes, draft=%zu bytes, file='%s'\n", slot_id, bytes_written,
+        draft_bytes_written, filepath.c_str());
 
     // Log per-file compression stats via delta from pre-save snapshot
     {
@@ -868,6 +925,19 @@ void kv_cache_disk_manager::remove_entry(const std::string & filepath) {
     } catch (const std::exception & e) {
         LOG_WRN("KV cache eviction: failed to remove '%s': %s\n", filepath.c_str(), e.what());
     }
+
+    // Also remove the companion draft file if it exists
+    std::string draft_filepath = filepath + ".draft";
+    try {
+        if (std::filesystem::exists(draft_filepath)) {
+            std::filesystem::remove(draft_filepath);
+        }
+    } catch (const std::exception & e) {
+        LOG_WRN("KV cache eviction: failed to remove companion draft '%s': %s\n", draft_filepath.c_str(), e.what());
+    }
+
+    // Also remove the companion pending_h file if it exists
+    delete_pending_h(filepath);
 }
 
 void kv_cache_disk_manager::update_cache_size(int64_t delta_bytes) {
@@ -890,12 +960,33 @@ void kv_cache_disk_manager::reconcile_orphaned_files() {
     }
 
     try {
+        // First pass: remove orphaned .draft files whose companion main file is missing
         for (const auto & entry : std::filesystem::directory_iterator(cache_dir_)) {
             if (!entry.is_regular_file()) {
                 continue;
             }
 
             const std::string filepath = entry.path().string();
+
+            // Check if this is a .draft companion file
+            if (filepath.size() > 6 && filepath.substr(filepath.size() - 6) == ".draft") {
+                std::string main_filepath = filepath.substr(0, filepath.size() - 6);
+                if (!std::filesystem::exists(main_filepath)) {
+                    LOG("KV cache reconciliation: removing orphaned draft file '%s'\n", filepath.c_str());
+                    std::filesystem::remove(filepath);
+                }
+                continue;  // Skip .draft files in main orphan check
+            }
+
+            // Check if this is a .pending companion file
+            if (filepath.size() > 8 && filepath.substr(filepath.size() - 8) == ".pending") {
+                std::string main_filepath = filepath.substr(0, filepath.size() - 8);
+                if (!std::filesystem::exists(main_filepath)) {
+                    LOG("KV cache reconciliation: removing orphaned pending_h file '%s'\n", filepath.c_str());
+                    std::filesystem::remove(filepath);
+                }
+                continue;  // Skip .pending files in main orphan check
+            }
 
             // Check if file is in our index
             if (filepath_index_.find(filepath) == filepath_index_.end()) {
@@ -923,9 +1014,16 @@ void kv_cache_disk_manager::purge_all_cache_files() {
     // Collect filepaths first to avoid modifying lru_ring_ while iterating
     std::vector<std::string> filepaths;
     for (const auto & entry : std::filesystem::directory_iterator(cache_dir_)) {
-        if (entry.is_regular_file()) {
-            filepaths.push_back(entry.path().string());
+        if (!entry.is_regular_file()) {
+            continue;
         }
+        std::string filepath = entry.path().string();
+        // Skip .draft and .pending companion files (their companion is already collected)
+        if ((filepath.size() > 6 && filepath.substr(filepath.size() - 6) == ".draft") ||
+            (filepath.size() > 8 && filepath.substr(filepath.size() - 8) == ".pending")) {
+            continue;
+        }
+        filepaths.push_back(filepath);
     }
 
     for (const auto & filepath : filepaths) {
@@ -934,4 +1032,42 @@ void kv_cache_disk_manager::purge_all_cache_files() {
     }
 
     LOG("KV cache purge complete: freed %zu bytes, removed %zu files\n", total_freed, files_removed);
+}
+
+std::vector<float> kv_cache_disk_manager::load_pending_h(const std::string & filepath) const {
+    std::string pending_filepath = filepath + ".pending";
+    FILE *      fp               = fopen(pending_filepath.c_str(), "rb");
+    if (!fp) {
+        // No pending file is normal (e.g. non-MTP cache entries)
+        return {};
+    }
+    // Get file size
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (file_size <= 0 || (file_size % sizeof(float)) != 0) {
+        LOG_WRN("KV cache load: invalid pending_h file '%s' (size %ld)\n", pending_filepath.c_str(), file_size);
+        fclose(fp);
+        return {};
+    }
+    std::vector<float> data(file_size / sizeof(float));
+    size_t             items_read = fread(data.data(), sizeof(float), data.size(), fp);
+    fclose(fp);
+    if (items_read != data.size()) {
+        LOG_WRN("KV cache load: failed to read pending_h from '%s' (%zu/%zu)\n", pending_filepath.c_str(), items_read,
+                data.size());
+        return {};
+    }
+    return data;
+}
+
+void kv_cache_disk_manager::delete_pending_h(const std::string & filepath) const {
+    std::string pending_filepath = filepath + ".pending";
+    try {
+        if (std::filesystem::exists(pending_filepath)) {
+            std::filesystem::remove(pending_filepath);
+        }
+    } catch (const std::exception & e) {
+        LOG_WRN("KV cache: failed to remove pending_h file '%s': %s\n", pending_filepath.c_str(), e.what());
+    }
 }

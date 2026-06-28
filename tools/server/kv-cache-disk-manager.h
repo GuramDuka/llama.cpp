@@ -153,8 +153,12 @@ class kv_cache_disk_manager {
     // Restore KV cache state from disk file to slot context
     // filepath: path to saved state file
     // ctx_tgt: target context for restoration
+    // ctx_dft: draft context for restoration (may be nullptr)
     // Returns true on success
-    bool restore_from_disk(const std::string & filepath, int32_t slot_id, llama_context * ctx_tgt);
+    bool restore_from_disk(const std::string & filepath,
+                           int32_t             slot_id,
+                           llama_context *     ctx_tgt,
+                           llama_context *     ctx_dft = nullptr);
 
     // Set the slot prompt similarity threshold for cache matching
     // This allows tuning sensitivity based on --slot-prompt-similarity parameter
@@ -165,12 +169,22 @@ class kv_cache_disk_manager {
 
     // Save the current KV cache state to disk after successful generation
     // tokens: token sequence for LCP matching (first N tokens stored)
+    // pending_h: optional MTP pending_h embedding data (saved to sidecar .pending file)
     // Returns true on success
-    bool save_to_disk(int32_t         slot_id,
-                      llama_context * ctx_tgt,
-                      llama_context * ctx_dft     = nullptr,
-                      const int32_t * tokens      = nullptr,
-                      size_t          token_count = 0);
+    bool save_to_disk(int32_t                    slot_id,
+                      llama_context *            ctx_tgt,
+                      llama_context *            ctx_dft     = nullptr,
+                      const int32_t *            tokens      = nullptr,
+                      size_t                     token_count = 0,
+                      const std::vector<float> * pending_h   = nullptr);
+
+    // Load MTP pending_h embedding data from the sidecar .pending file.
+    // filepath: path to the main .bin cache file (sidecar is filepath + ".pending")
+    // Returns the loaded pending_h vector, or empty vector if the file doesn't exist.
+    std::vector<float> load_pending_h(const std::string & filepath) const;
+
+    // Delete the .pending sidecar file associated with a cache entry
+    void delete_pending_h(const std::string & filepath) const;
 
     // Get the LCP ratio between a disk cache entry (identified by filepath) and a token sequence
     float get_disk_lcp(const std::string & filepath, const std::vector<int32_t> & tokens) const;

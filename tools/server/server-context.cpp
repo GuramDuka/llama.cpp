@@ -161,6 +161,27 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // Pristine draft model state captured right after prompt processing
+    // (before any generation). Used by the L3 disk cache to save the draft
+    // model's state at the beginning of generation instead of the end, so
+    // that after L3 restore + seq_rm the draft cells have correct content.
+    std::vector<uint8_t> draft_state_preamble;
+
+    // Pristine target model state captured after the FIRST N-1 prompt tokens
+    // (before the last prompt token is processed). Used by the L3 disk cache
+    // to save the target recurrent state at position N-2 instead of the end
+    // of generation, so that after L3 restore + seq_rm the target recurrent
+    // state has correct content (avoids double-counting the last prompt token).
+    bool                 target_preamble_captured = false;
+    std::vector<uint8_t> target_state_preamble;
+
+    // MTP pending_h embedding at the preamble position (target nextn at N-2).
+    // This is the carry-over embedding that the MTP draft head uses as input for
+    // the first token of the next batch.  Saved alongside the preamble so that
+    // after L3 restore the MTP head receives the correct embedding instead of
+    // stale zeros from a previous generation cycle.
+    std::vector<float> spec_pending_h;
+
     // multimodal
     mtmd_context *  mctx   = nullptr;
     mtmd::batch_ptr mbatch = nullptr;
@@ -244,6 +265,15 @@ struct server_slot {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else {
+            // The prompt cache (L2) restores the full KV state.  Mark the target
+            // preamble as captured so the batch-split break condition (which checks
+            // target_preamble_captured at task.n_tokens()-1) does not fire on
+            // restored slots.  Without this, the batch would be empty and the
+            // server would loop forever in PROCESSING_PROMPT.
+            // We do NOT populate target_state_preamble here because the restored
+            // state is end-of-generation, not the preamble-at-N-2.
+            target_preamble_captured = true;
         }
 
         return res;
@@ -337,6 +367,11 @@ struct server_slot {
 
         // clear alora start
         alora_invocation_start = -1;
+
+        draft_state_preamble.clear();
+        target_state_preamble.clear();
+        spec_pending_h.clear();
+        target_preamble_captured = false;
 
         // clear multimodal state
         mbatch.reset();
@@ -1387,11 +1422,153 @@ struct server_context_impl {
                 if (slot.task_tokens_original.empty()) {
                     return;
                 }
+
+                // If we have a pristine draft preamble, temporarily swap ctx_dft's
+                // state so that the .draft companion file stores the pre-generation
+                // draft state instead of the end-of-generation state.  This ensures
+                // that after L3 restore + seq_rm the draft cells have correct content.
+                std::vector<uint8_t> saved_draft_state;
+                fprintf(stderr,
+                        "DBG_PREAMBLE L3 save callback: ctx_dft=%p preamble_empty=%d preamble_sz=%zu "
+                        "task_tokens_orig_sz=%zu\n",
+                        (void *) slot.ctx_dft, (int) slot.draft_state_preamble.empty(),
+                        slot.draft_state_preamble.size(), slot.task_tokens_original.size());
+                fflush(stderr);
+                if (slot.ctx_dft && !slot.draft_state_preamble.empty()) {
+                    // Snapshot the current (end-of-generation) draft state
+                    const size_t cur_sz =
+                        llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    saved_draft_state.resize(cur_sz);
+                    SLT_INF(slot, "L3 save: current draft state sz=%zu, preamble sz=%zu\n", cur_sz,
+                            slot.draft_state_preamble.size());
+                    if (cur_sz > 0) {
+                        llama_state_seq_get_data_ext(slot.ctx_dft, saved_draft_state.data(), cur_sz, slot.id,
+                                                     LLAMA_STATE_SEQ_FLAGS_NONE);
+                    }
+
+                    // Checksum the preamble
+                    uint32_t pre_hash = 0;
+                    for (size_t i = 0; i < slot.draft_state_preamble.size(); i += 4) {
+                        uint32_t v;
+                        memcpy(&v, &slot.draft_state_preamble[i],
+                               std::min((size_t) 4, slot.draft_state_preamble.size() - i));
+                        pre_hash ^= v;
+                    }
+                    SLT_INF(slot, "L3 save: swapping preamble (sz=%zu hash=0x%08x) over current draft (sz=%zu)\n",
+                            slot.draft_state_preamble.size(), pre_hash, cur_sz);
+
+                    // The preamble was captured at DONE_PROMPT (before any decode).
+                    // For the MTP draft model (llama_kv_cache), cell_count may be 0
+                    // (empty cache).  `state_seq_set_data_ext` with cell_count=0 in
+                    // `llama_kv_cache::state_read` skips without clearing existing cells
+                    // (the state_read function `continue`s on cell_count==0).
+                    // seq_rm first so the preamble restore actually takes effect.
+                    {
+                        const size_t pre_sz =
+                            llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                        common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
+                        const size_t post_sz =
+                            llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                        fprintf(stderr, "DBG_PREAMBLE_RM: pre_sz=%zu post_sz=%zu id=%d\n", pre_sz, post_sz, slot.id);
+                    }
+
+                    // Replace ctx_dft with the pristine preamble state for saving
+                    const size_t set_ret = llama_state_seq_set_data_ext(slot.ctx_dft, slot.draft_state_preamble.data(),
+                                                                        slot.draft_state_preamble.size(), slot.id, 0);
+                    {
+                        const size_t after_sz =
+                            llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                        fprintf(stderr, "DBG_PREAMBLE_RESTORE: preamble_sz=%zu set_ret=%zu after_sz=%zu id=%d\n",
+                                slot.draft_state_preamble.size(), set_ret, after_sz, slot.id);
+                    }
+                    if (set_ret == 0) {
+                        SLT_WRN(slot, "L3 save: PREAMBLE RESTORE FAILED (returned 0)\n", 0);
+                    }
+                    // Verify: check draft state size after preamble restore
+                    const size_t after_sz =
+                        llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    SLT_INF(slot, "L3 save: after preamble restore, ctx_dft state sz=%zu\n", after_sz);
+                }
+
+                // If we have a pristine target preamble, temporarily swap ctx_tgt's
+                // state so that the main file stores the pre-last-token target state
+                // instead of the end-of-generation state.  This ensures that after
+                // L3 restore + seq_rm the target recurrent cells have correct content
+                // (state data matches cell.pos, avoiding double-counting of the last
+                // prompt token).
+                std::vector<uint8_t> saved_target_state;
+                if (slot.target_preamble_captured && !slot.target_state_preamble.empty()) {
+                    // Snapshot the current (end-of-generation) target state
+                    const size_t cur_sz =
+                        llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    saved_target_state.resize(cur_sz);
+                    if (cur_sz > 0) {
+                        llama_state_seq_get_data_ext(slot.ctx_tgt, saved_target_state.data(), cur_sz, slot.id,
+                                                     LLAMA_STATE_SEQ_FLAGS_NONE);
+                    }
+                    {
+                        uint32_t pre_hash = 0;
+                        for (size_t i = 0; i < slot.target_state_preamble.size(); i += 4) {
+                            uint32_t v;
+                            memcpy(&v, &slot.target_state_preamble[i],
+                                   std::min((size_t) 4, slot.target_state_preamble.size() - i));
+                            pre_hash ^= v;
+                        }
+                        SLT_INF(slot,
+                                "L3 save: swapping target preamble (sz=%zu hash=0x%08x) over current target (sz=%zu)\n",
+                                slot.target_state_preamble.size(), pre_hash, cur_sz);
+                    }
+
+                    // seq_rm first so the preamble restore actually takes effect
+                    common_context_seq_rm(slot.ctx_tgt, slot.id, -1, -1);
+
+                    // Replace ctx_tgt with the pristine preamble state for saving
+                    const size_t set_ret = llama_state_seq_set_data_ext(slot.ctx_tgt, slot.target_state_preamble.data(),
+                                                                        slot.target_state_preamble.size(), slot.id, 0);
+                    if (set_ret == 0) {
+                        SLT_WRN(slot, "L3 save: TARGET PREAMBLE RESTORE FAILED (returned 0)\n", 0);
+                    }
+                }
+
+                // Capture the current MTP pending_h embedding (the last-generation
+                // value).  This gets saved to a sidecar .pending file and restored
+                // on L3 cache hit, so that the L1 cache path (which uses the stale
+                // pending_h from the previous generation) and the L3 cache path
+                // (which restores it) have the same pending_h for the first prompt
+                // token of the next request.
+                {
+                    const size_t n_embd_pending = common_speculative_get_pending_h(slot.spec, slot.id, nullptr);
+                    if (n_embd_pending > 0) {
+                        slot.spec_pending_h.resize(n_embd_pending);
+                        common_speculative_get_pending_h(slot.spec, slot.id, slot.spec_pending_h.data());
+                        SLT_DBG(slot, "L3 save: spec pending_h captured at save time: %zu floats\n", n_embd_pending);
+                    }
+                }
+
                 const int64_t save_start = ggml_time_us();
-                bool          ok =
-                    kv_cache_disk_mgr->save_to_disk(slot.id, slot.ctx_tgt, slot.ctx_dft,
-                                                    slot.task_tokens_original.data(), slot.task_tokens_original.size());
+                bool          ok         = kv_cache_disk_mgr->save_to_disk(
+                    slot.id, slot.ctx_tgt, slot.ctx_dft, slot.task_tokens_original.data(),
+                    slot.task_tokens_original.size(), slot.spec_pending_h.empty() ? nullptr : &slot.spec_pending_h);
                 cache_metrics.on_l3_save(ggml_time_us() - save_start, 0, 0, ok);
+
+                // Restore the original end-of-generation target state
+                if (!saved_target_state.empty()) {
+                    common_context_seq_rm(slot.ctx_tgt, slot.id, -1, -1);
+                    const size_t restore_ret = llama_state_seq_set_data_ext(slot.ctx_tgt, saved_target_state.data(),
+                                                                            saved_target_state.size(), slot.id, 0);
+                    if (restore_ret == 0) {
+                        SLT_WRN(slot, "L3 save: RESTORE OF ORIGINAL TARGET STATE FAILED\n", 0);
+                    }
+                }
+
+                // Restore the original end-of-generation draft state
+                if (!saved_draft_state.empty()) {
+                    const size_t restore_ret = llama_state_seq_set_data_ext(slot.ctx_dft, saved_draft_state.data(),
+                                                                            saved_draft_state.size(), slot.id, 0);
+                    if (restore_ret == 0) {
+                        SLT_WRN(slot, "L3 save: RESTORE OF ORIGINAL DRAFT STATE FAILED\n", 0);
+                    }
+                }
             };
 
             // Fork: Wire up L2 (RAM) save callback
@@ -1699,6 +1876,14 @@ struct server_context_impl {
                             SLT_INF(*ret,
                                     "selected slot by LCP similarity (L1), sim = %.3f (thold=%.3f), f_keep = %.3f\n",
                                     best.similarity, slot_prompt_similarity, f_keep);
+                            // The slot retains its KV cache from the previous generation
+                            // (end-of-generation state).  Mark the preamble as captured so
+                            // the batch-split break condition does not fire, which would
+                            // add zero tokens and cause an infinite loop.
+                            // We do NOT populate target_state_preamble because the slot's
+                            // state is end-of-generation, not the preamble-at-N-2.
+                            SLT_DBG(*ret, "%s", "L1 slot reuse: marking preamble as captured\n");
+                            ret->target_preamble_captured = true;
                             break;
                         }
                     case cache_candidate::TIER_L2_RAM:
@@ -1736,8 +1921,8 @@ struct server_context_impl {
                                     if (slot.is_processing()) {
                                         continue;
                                     }
-                                    bool restored =
-                                        kv_cache_disk_mgr->restore_from_disk(best.filepath, slot.id, ctx_tgt);
+                                    bool restored = kv_cache_disk_mgr->restore_from_disk(best.filepath, slot.id,
+                                                                                         ctx_tgt, ctx_dft.get());
                                     if (restored) {
                                         slot.prompt.tokens =
                                             server_tokens(task.tokens.get_tokens(), task.tokens.has_mtmd);
@@ -1747,6 +1932,81 @@ struct server_context_impl {
                                         // Do not promote to L2 here: the request has not been processed yet,
                                         // and L2 save will happen naturally on slot release
                                         // (callback_save_kv_cache_to_ram).
+
+                                        // The preamble state at position N-2 (before the last prompt token)
+                                        // was already captured and saved to disk.  After restore it is
+                                        // present in the KV cache, so mark it as captured to prevent the
+                                        // batch-split break condition from firing again (which would add
+                                        // zero tokens and cause an infinite loop).
+                                        {
+                                            const size_t sz = llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id,
+                                                                                           LLAMA_STATE_SEQ_FLAGS_NONE);
+                                            slot.target_state_preamble.resize(sz);
+                                            if (sz > 0) {
+                                                llama_state_seq_get_data_ext(slot.ctx_tgt,
+                                                                             slot.target_state_preamble.data(), sz,
+                                                                             slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                            }
+                                            slot.target_preamble_captured = true;
+                                            uint32_t pre_hash             = 0;
+                                            for (size_t i = 0; i < sz; i += 4) {
+                                                uint32_t v;
+                                                memcpy(&v, &slot.target_state_preamble[i],
+                                                       std::min((size_t) 4, sz - i));
+                                                pre_hash ^= v;
+                                            }
+                                            SLT_INF(slot,
+                                                    "target preamble restored from L3 cache: sz=%zu hash=0x%08x\n", sz,
+                                                    pre_hash);
+
+                                            // Also restore the draft preamble at position N-2 from the
+                                            // restored draft context.  This ensures the draft preamble
+                                            // is at the same position as the target preamble, preventing
+                                            // double-counting of the last prompt token.
+                                            if (slot.ctx_dft) {
+                                                const size_t sz_dft = llama_state_seq_get_size_ext(
+                                                    slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                                slot.draft_state_preamble.resize(sz_dft);
+                                                if (sz_dft > 0) {
+                                                    llama_state_seq_get_data_ext(
+                                                        slot.ctx_dft, slot.draft_state_preamble.data(), sz_dft, slot.id,
+                                                        LLAMA_STATE_SEQ_FLAGS_NONE);
+                                                }
+                                                uint32_t dft_hash = 0;
+                                                for (size_t i = 0; i < sz_dft; i += 4) {
+                                                    uint32_t v;
+                                                    memcpy(&v, &slot.draft_state_preamble[i],
+                                                           std::min((size_t) 4, sz_dft - i));
+                                                    dft_hash ^= v;
+                                                }
+                                                SLT_DBG(slot,
+                                                        "draft preamble restored from L3 cache: sz=%zu hash=0x%08x\n",
+                                                        sz_dft, dft_hash);
+                                                fprintf(stderr,
+                                                        "DBG after L3 restore: slot %d target_sz=%zu "
+                                                        "target_hash=0x%08x draft_sz=%zu draft_hash=0x%08x\n",
+                                                        slot.id, sz, pre_hash, sz_dft, dft_hash);
+                                                fflush(stderr);
+
+                                                // Restore the MTP pending_h embedding from the sidecar file.
+                                                // This is the carry-over embedding saved at L3-save time
+                                                // (the last-generation value).  The MTP head uses it as
+                                                // input for the first prompt token after restore, matching
+                                                // what the L1 cache path would have (stale pending_h from
+                                                // the previous generation).  Without this the draft would
+                                                // use stale embeddings from the constructor (zeros) or
+                                                // some other cycle.
+                                                std::vector<float> pending_h =
+                                                    kv_cache_disk_mgr->load_pending_h(best.filepath);
+                                                if (!pending_h.empty()) {
+                                                    common_speculative_set_pending_h(
+                                                        slot.spec, slot.id, pending_h.data(), pending_h.size());
+                                                    slot.spec_pending_h = std::move(pending_h);
+                                                    SLT_DBG(slot, "spec pending_h restored from L3 cache: %zu floats\n",
+                                                            slot.spec_pending_h.size());
+                                                }
+                                            }
+                                        }
                                         break;
                                     }
                                 }
@@ -3139,6 +3399,27 @@ struct server_context_impl {
 
         // generate the actual drafts (if any)
         {
+            // DBG: log draft state hash right before drafting
+            iterate(drafting, [&](server_slot & slot) {
+                if (slot.ctx_dft) {
+                    const size_t dft_sz =
+                        llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    std::vector<uint8_t> dft_data(dft_sz);
+                    if (dft_sz > 0) {
+                        llama_state_seq_get_data_ext(slot.ctx_dft, dft_data.data(), dft_sz, slot.id,
+                                                     LLAMA_STATE_SEQ_FLAGS_NONE);
+                    }
+                    uint32_t dft_hash = 0;
+                    for (size_t i = 0; i < dft_sz; i += 4) {
+                        uint32_t v;
+                        memcpy(&v, &dft_data[i], std::min((size_t) 4, dft_sz - i));
+                        dft_hash ^= v;
+                    }
+                    fprintf(stderr, "DBG draft state BEFORE DRAFT: slot %d sz=%zu hash=0x%08x\n", slot.id, dft_sz,
+                            dft_hash);
+                    fflush(stderr);
+                }
+            });
             common_speculative_draft(spec.get());
         }
 
@@ -3676,6 +3957,16 @@ struct server_context_impl {
                             break;
                         }
 
+                        // If target preamble hasn't been captured yet, split at the
+                        // last prompt token so we can capture the recurrent state
+                        // BEFORE the last token is processed.  This ensures that
+                        // after L3 restore + seq_rm the state data matches cell.pos.
+                        if (!slot.target_preamble_captured && slot.prompt.n_tokens() == slot.task->n_tokens() - 1) {
+                            SLT_DBG(slot, "stop prompt batch filling to capture target preamble at pos %d\n",
+                                    slot.prompt.n_tokens() - 1);
+                            break;
+                        }
+
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
@@ -3724,6 +4015,28 @@ struct server_context_impl {
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+
+                        // Snapshot the draft model's state for L3 save.  The draft preamble is
+                        // normally captured at position N-2 in post_decode (alongside the target
+                        // preamble).  This fallback captures at position N-1 for the case where
+                        // post_decode did not fire (e.g. the prompt fits in a single batch and
+                        // no batch split occurred).
+                        if (slot.ctx_dft && slot.draft_state_preamble.empty()) {
+                            const size_t sz =
+                                llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                            slot.draft_state_preamble.resize(sz);
+                            if (sz > 0) {
+                                llama_state_seq_get_data_ext(slot.ctx_dft, slot.draft_state_preamble.data(), sz,
+                                                             slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                            }
+                            uint32_t pre_hash = 0;
+                            for (size_t i = 0; i < sz; i += 4) {
+                                uint32_t v;
+                                memcpy(&v, &slot.draft_state_preamble[i], std::min((size_t) 4, sz - i));
+                                pre_hash ^= v;
+                            }
+                            SLT_INF(slot, "preamble captured: sz=%zu hash=0x%08x\n", sz, pre_hash);
+                        }
 
                         GGML_ASSERT(batch.size() > 0);
 
@@ -3911,6 +4224,52 @@ struct server_context_impl {
             return idx >= off && idx < off + n_batch_tokens;
         };
 
+        // Capture target preamble for any slot that just had its pre-last batch
+        // decoded (prompt tokens 0..N-2).  The batch was intentionally split at
+        // task.n_tokens()-1 so we could capture the recurrent state BEFORE the
+        // last prompt token is processed.  This state at position N-2 is the
+        // correct starting state for the L3 restore path.
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT && !slot.target_preamble_captured) {
+                const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                slot.target_state_preamble.resize(sz);
+                if (sz > 0) {
+                    llama_state_seq_get_data_ext(ctx_tgt, slot.target_state_preamble.data(), sz, slot.id,
+                                                 LLAMA_STATE_SEQ_FLAGS_NONE);
+                }
+                uint32_t hash = 0;
+                for (size_t i = 0; i < sz; i += 4) {
+                    uint32_t v;
+                    memcpy(&v, &slot.target_state_preamble[i], std::min((size_t) 4, sz - i));
+                    hash ^= v;
+                }
+                slot.target_preamble_captured = true;
+                SLT_INF(slot, "target preamble captured: sz=%zu hash=0x%08x (after %d of %d tokens)\n", sz, hash,
+                        slot.prompt.n_tokens(), slot.task->n_tokens());
+
+                // Also capture the draft model's preamble at position N-2 (same position as
+                // the target preamble).  This ensures that after L3 restore both target and
+                // draft are restored to the same position, avoiding double-counting of the
+                // last prompt token by the draft model.
+                if (slot.ctx_dft) {
+                    const size_t sz_dft =
+                        llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    slot.draft_state_preamble.resize(sz_dft);
+                    if (sz_dft > 0) {
+                        llama_state_seq_get_data_ext(slot.ctx_dft, slot.draft_state_preamble.data(), sz_dft, slot.id,
+                                                     LLAMA_STATE_SEQ_FLAGS_NONE);
+                    }
+                    uint32_t dft_hash = 0;
+                    for (size_t i = 0; i < sz_dft; i += 4) {
+                        uint32_t v;
+                        memcpy(&v, &slot.draft_state_preamble[i], std::min((size_t) 4, sz_dft - i));
+                        dft_hash ^= v;
+                    }
+                    SLT_DBG(slot, "draft preamble captured at pos N-2: sz=%zu hash=0x%08x\n", sz_dft, dft_hash);
+                }
+            }
+        }
+
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
         iterate(slots, [&](server_slot & slot) {
@@ -3967,6 +4326,27 @@ struct server_context_impl {
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
+
+                // DBG: log draft state hash right when prompt transitions to GENERATING
+                if (slot.ctx_dft) {
+                    const size_t dft_sz =
+                        llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    std::vector<uint8_t> dft_data(dft_sz);
+                    if (dft_sz > 0) {
+                        llama_state_seq_get_data_ext(slot.ctx_dft, dft_data.data(), dft_sz, slot.id,
+                                                     LLAMA_STATE_SEQ_FLAGS_NONE);
+                    }
+                    uint32_t dft_hash = 0;
+                    for (size_t i = 0; i < dft_sz; i += 4) {
+                        uint32_t v;
+                        memcpy(&v, &dft_data[i], std::min((size_t) 4, dft_sz - i));
+                        dft_hash ^= v;
+                    }
+                    fprintf(stderr, "DBG draft state at GENERATING: slot %d sz=%zu hash=0x%08x\n", slot.id, dft_sz,
+                            dft_hash);
+                    fflush(stderr);
+                }
+
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }

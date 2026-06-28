@@ -1,7 +1,7 @@
 #pragma once
 
-#include "llama.h"
 #include "common.h"
+#include "llama.h"
 
 struct common_speculative;
 
@@ -71,6 +71,16 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
+// Get/set the pending_h embedding for MTP.  pending_h is the target nextn embedding
+// that "carries over" between consecutive process() calls for the same seq_id.
+// It is used as the MTP head input at batch position 0 (the first token in a batch
+// whose predecessor's embedding comes from a previous batch).  After L3 cache
+// restore the normal carry-over is lost, so we save and restore this embedding
+// alongside the preamble.
+// Returns the number of floats written / read (n_embd), or 0 if not supported.
+size_t common_speculative_get_pending_h(common_speculative * spec, llama_seq_id seq_id, float * h);
+void   common_speculative_set_pending_h(common_speculative * spec, llama_seq_id seq_id, const float * h, size_t n_embd);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
