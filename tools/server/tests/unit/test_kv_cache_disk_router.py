@@ -230,7 +230,7 @@ def test_disk_lcp_wins_after_restart():
     _send_completion("Hello world from the server.", 8)
 
     compare_log = log.drain()
-    assert "restored slot from disk cache" in compare_log, (
+    assert "restored slot from L3 disk cache" in compare_log, (
         f"Disk restore not found: {compare_log[:800]}"
     )
 
@@ -262,7 +262,7 @@ def test_ram_cache_preferred():
     # Slot selection can result in LCP similarity, disk restore, or LRU fallback
     assert (
         "selected slot by LCP similarity" in compare_log
-        or "restored slot from disk cache" in compare_log
+        or "restored slot from L3 disk cache" in compare_log
         or "selected slot by LRU" in compare_log
     ), f"No slot selection log: {compare_log[:800]}"
 
@@ -367,8 +367,11 @@ def test_trie_rebuild_from_disk():
     cached_text = res_cached.body["content"]
 
     hit_log = log.drain()
-    assert "KV cache HIT" in hit_log, f"No HIT after rebuild: {hit_log[:800]}"
-    assert "restored slot from disk cache" in hit_log, (
+    assert (
+        "best candidate from L3" in hit_log
+        or "restored slot from L3 disk cache" in hit_log
+    ), f"No L3 HIT after rebuild: {hit_log[:800]}"
+    assert "restored slot from L3 disk cache" in hit_log, (
         f"No restore after rebuild: {hit_log[:800]}"
     )
 
@@ -526,7 +529,10 @@ def test_multi_model_smoke():
             )
 
             hit_log = log.drain()
-            assert "KV cache HIT" in hit_log, f"{model_name}: no HIT after restart"
+            assert (
+                "best candidate from L3" in hit_log
+                or "restored slot from L3 disk cache" in hit_log
+            ), f"{model_name}: no L3 HIT after restart"
 
         finally:
             s.stop()

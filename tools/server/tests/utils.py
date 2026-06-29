@@ -691,7 +691,12 @@ class ServerPreset:
     def qwopus_mtp() -> ServerProcess:
         server = ServerProcess()
         server.offline = True
-        server.model_file = "models/Qwopus3.5-4B-Coder-MTP-Q5_K_M.gguf"
+        _utils_dir = os.path.dirname(os.path.abspath(__file__))
+        server.model_file = os.path.normpath(
+            os.path.join(
+                _utils_dir, "../../../models/Qwopus3.5-4B-Coder-MTP-Q5_K_M.gguf"
+            )
+        )
         server.model_hf_repo = None  # do not auto-download
         server.model_hf_file = None
         server.model_alias = "qwopus-mtp"
