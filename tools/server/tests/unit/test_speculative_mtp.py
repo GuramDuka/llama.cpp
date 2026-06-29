@@ -465,7 +465,6 @@ def _write_preset_ini(preset_path: str, model_paths: dict[str, str]) -> str:
     return preset_path
 
 
-_ROUTER_TESTS_ENABLED = os.environ.get("ROUTER_MODEL_TESTS") == "1"
 _ROUTER_MODEL_NAME = "qwopus-mtp"
 
 
@@ -516,10 +515,6 @@ def router_server():
             pass
 
 
-@pytest.mark.skipif(
-    not _ROUTER_TESTS_ENABLED,
-    reason="Set ROUTER_MODEL_TESTS=1 to run router-mode KV cache tests",
-)
 def test_router_kv_cache_init(router_server):
     """Router: KV cache auto enabled, disk manager initialized."""
     s = router_server
@@ -549,10 +544,6 @@ def test_router_kv_cache_init(router_server):
     assert os.path.isdir(s.slot_save_path)
 
 
-@pytest.mark.skipif(
-    not _ROUTER_TESTS_ENABLED,
-    reason="Set ROUTER_MODEL_TESTS=1 to run router-mode KV cache tests",
-)
 def test_router_first_request_save(router_server):
     """Router: first request saves KV cache to disk."""
     s = router_server
@@ -578,10 +569,6 @@ def test_router_first_request_save(router_server):
     assert len(os.listdir(s.slot_save_path)) > 0, "No cache files"
 
 
-@pytest.mark.skipif(
-    not _ROUTER_TESTS_ENABLED,
-    reason="Set ROUTER_MODEL_TESTS=1 to run router-mode KV cache tests",
-)
 def test_router_restart_disk_restore(router_server):
     """Router: after restart, disk cache restores for same request."""
     s = router_server
