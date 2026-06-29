@@ -199,6 +199,10 @@ struct server_slot {
     std::unique_ptr<const server_task> task;
     std::unique_ptr<const server_task> task_prev;  // used for debugging
 
+    // Flag to indicate if this slot was restored from disk (L3 cache).
+    // Used to skip certain operations that are not needed after restore.
+    bool restored_from_disk = false;
+
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
@@ -1927,8 +1931,9 @@ struct server_context_impl {
                                     if (restored) {
                                         slot.prompt.tokens =
                                             server_tokens(task.tokens.get_tokens(), task.tokens.has_mtmd);
-                                        ret   = &slot;
-                                        l3_ok = true;
+                                        slot.restored_from_disk = true;
+                                        ret                     = &slot;
+                                        l3_ok                   = true;
                                         SLT_INF(*ret, "restored slot from L3 disk cache '%s'\n", best.filepath.c_str());
                                         // Do not promote to L2 here: the request has not been processed yet,
                                         // and L2 save will happen naturally on slot release
@@ -3869,10 +3874,15 @@ struct server_context_impl {
                     const llama_pos p0 = slot.prompt.tokens.pos_next();
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+                    SLT_TRC(slot, "restored_from_disk = %s\n", slot.restored_from_disk ? "true" : "false");
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                    // After L3 restore, the KV cache is already in the correct state.
+                    // Skip memory_seq_rm to avoid clearing the restored cache.
+                    if (!slot.restored_from_disk) {
+                        common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                        }
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -3947,6 +3957,17 @@ struct server_context_impl {
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
                             break;  // end of text chunk
+                        }
+
+                        // After L3 restore, if n_past was decremented to force at least 1 token evaluation,
+                        // we need to ensure the first token is processed. This handles the case where
+                        // the prompt is fully cached but n_past was decremented.
+                        if (slot.n_prompt_tokens_cache == slot.task->n_tokens() - 1 && batch.size() == 0) {
+                            SLT_DBG(slot,
+                                    "forcing first token processing after L3 restore (n_past = %d, n_tokens = %d)\n",
+                                    slot.n_prompt_tokens_cache, slot.task->n_tokens());
+                            // Process the first token that was already in the KV cache
+                            cur_tok = input_tokens[0];
                         }
 
                         // if this is an alora request with pre-invocation
