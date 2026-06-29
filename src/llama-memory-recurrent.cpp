@@ -193,7 +193,24 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     return true;
                 }
                 // rollback not possible (n_rs_seq == 0 or rollback > n_rs_seq),
-                // fall through to normal cell clearing below
+                // When the rollback distance exceeds n_rs_seq and this is the last
+                // surviving cell for the sequence (no other cells with this seq_id),
+                // keep the cell alive by adjusting its position to p0-1 instead of
+                // clearing it.  This preserves the restored state (e.g. from L3 disk
+                // cache) so that subsequent find_slot can chain from it.
+                // Without this, the cell is cleared and find_slot allocates a fresh
+                // cell at the zero state, producing wrong output.
+                bool has_other = false;
+                for (uint32_t j = 0; j < size; ++j) {
+                    if (j != (uint32_t) tail_id && cells[j].has_seq_id(seq_id)) {
+                        has_other = true;
+                        break;
+                    }
+                }
+                if (!has_other && tail_id >= 0) {
+                    cell.pos = p0 - 1;
+                    return true;
+                }
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
@@ -234,6 +251,22 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     // If we freed up a slot, set head to it so searching can start there.
     if (new_head != size && new_head < head) {
         head = new_head;
+    }
+
+    // If the tail was invalidated by removal but the sequence still has
+    // surviving cells, find the new tail.  This is needed when seq_rm tears
+    // down positions after a given point (e.g. [p0, end)) and a subsequent
+    // find_slot needs to chain from the last surviving cell.  Without this,
+    // find_slot would allocate a fresh cell whose src points to itself,
+    // causing the SSM state to double-count the token at p0.
+    if (seq_id >= 0 && cells[seq_id].tail < 0) {
+        int32_t last_pos = -1;
+        for (uint32_t i = 0; i < size; ++i) {
+            if (cells[i].has_seq_id(seq_id) && cells[i].pos > last_pos) {
+                last_pos           = cells[i].pos;
+                cells[seq_id].tail = i;
+            }
+        }
     }
 
     return true;

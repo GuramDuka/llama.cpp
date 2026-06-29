@@ -370,6 +370,7 @@ struct server_slot {
 
         draft_state_preamble.clear();
         target_state_preamble.clear();
+        sampled = 0;
         spec_pending_h.clear();
         target_preamble_captured = false;
 
@@ -3961,7 +3962,10 @@ struct server_context_impl {
                         // last prompt token so we can capture the recurrent state
                         // BEFORE the last token is processed.  This ensures that
                         // after L3 restore + seq_rm the state data matches cell.pos.
-                        if (!slot.target_preamble_captured && slot.prompt.n_tokens() == slot.task->n_tokens() - 1) {
+                        // Only applies when there are at least 2 prompt tokens -- with
+                        // a single-token prompt there is no preamble to capture.
+                        if (!slot.target_preamble_captured && slot.task->n_tokens() > 1 &&
+                            slot.prompt.n_tokens() == slot.task->n_tokens() - 1) {
                             SLT_DBG(slot, "stop prompt batch filling to capture target preamble at pos %d\n",
                                     slot.prompt.n_tokens() - 1);
                             break;
@@ -4325,6 +4329,15 @@ struct server_context_impl {
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                    // common_speculative_begin() resets pending_h to zeros to prevent
+                    // stale embeddings from a previous request.  If it was loaded from
+                    // the L3 sidecar file (during get_available_slot), restore it so
+                    // the MTP head has the correct carry-over embedding for the first
+                    // draft step.
+                    if (!slot.spec_pending_h.empty()) {
+                        common_speculative_set_pending_h(slot.spec, slot.id, slot.spec_pending_h.data(),
+                                                         slot.spec_pending_h.size());
+                    }
                 }
 
                 // DBG: log draft state hash right when prompt transitions to GENERATING
