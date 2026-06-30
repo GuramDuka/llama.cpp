@@ -1535,13 +1535,13 @@ struct server_context_impl {
                     }
                 }
 
-                // Capture the current MTP pending_h embedding (the last-generation
-                // value).  This gets saved to a sidecar .pending file and restored
-                // on L3 cache hit, so that the L1 cache path (which uses the stale
-                // pending_h from the previous generation) and the L3 cache path
-                // (which restores it) have the same pending_h for the first prompt
-                // token of the next request.
-                {
+                // Capture the current MTP pending_h embedding ONLY if not already
+                // captured at preamble time (post_decode N-2 or DONE_PROMPT).
+                // The preamble-captured value (h_nextn at position N-2) is the
+                // correct draft embedding for the first remaining prompt token.
+                // Overwriting it with the end-of-generation value (h_nextn at N-1)
+                // causes the restored run to use a stale embedding.
+                if (slot.spec_pending_h.empty()) {
                     const size_t n_embd_pending = common_speculative_get_pending_h(slot.spec, slot.id, nullptr);
                     if (n_embd_pending > 0) {
                         slot.spec_pending_h.resize(n_embd_pending);
@@ -2005,6 +2005,12 @@ struct server_context_impl {
                                                 std::vector<float> pending_h =
                                                     kv_cache_disk_mgr->load_pending_h(best.filepath);
                                                 if (!pending_h.empty()) {
+                                                    fprintf(stderr,
+                                                            "DBG_PENDING_H_AT_RESTORE: slot=%d sz=%zu "
+                                                            "first=%.8f last=%.8f\n",
+                                                            slot.id, pending_h.size(), (double) pending_h[0],
+                                                            (double) pending_h.back());
+                                                    fflush(stderr);
                                                     common_speculative_set_pending_h(
                                                         slot.spec, slot.id, pending_h.data(), pending_h.size());
                                                     slot.spec_pending_h = std::move(pending_h);
@@ -3599,6 +3605,31 @@ struct server_context_impl {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
+                                // L3 (disk) restore only loads the preamble state (captured at
+                                // approximately N-2 during the original run).  Use the actual KV
+                                // cell count rather than the token-match prefix, otherwise the
+                                // code would think all matching tokens are cached when only the
+                                // preamble subset is actually present.  Processing a token near
+                                // the end of the prompt with stale/zero KV for the missing
+                                // middle range produces wrong internal hidden states, which
+                                // causes MTP draft KV divergence.
+                                if (slot.restored_from_disk) {
+                                    const auto mem = llama_get_memory(ctx_tgt);
+                                    if (mem) {
+                                        const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot.id);
+                                        if (pos_max >= 0) {
+                                            const int n_cached = pos_max + 1;
+                                            if (n_cached < n_past) {
+                                                SLT_DBG(slot,
+                                                        "L3 restore: overriding n_past from %d to %d "
+                                                        "(KV cell count)\n",
+                                                        n_past, n_cached);
+                                                n_past = n_cached;
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
                                     SLT_DBG(slot,
@@ -4041,6 +4072,26 @@ struct server_context_impl {
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
+                        // Capture target preamble at position N-1 for the single-batch case
+                        // where post_decode did not fire.
+                        if (!slot.target_preamble_captured) {
+                            const size_t sz =
+                                llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                            slot.target_state_preamble.resize(sz);
+                            if (sz > 0) {
+                                llama_state_seq_get_data_ext(ctx_tgt, slot.target_state_preamble.data(), sz, slot.id,
+                                                             LLAMA_STATE_SEQ_FLAGS_NONE);
+                            }
+                            slot.target_preamble_captured = true;
+                            uint32_t hash                 = 0;
+                            for (size_t i = 0; i < sz; i += 4) {
+                                uint32_t v;
+                                memcpy(&v, &slot.target_state_preamble[i], std::min((size_t) 4, sz - i));
+                                hash ^= v;
+                            }
+                            SLT_INF(slot, "target preamble captured at DONE_PROMPT: sz=%zu hash=0x%08x\n", sz, hash);
+                        }
+
                         // Snapshot the draft model's state for L3 save.  The draft preamble is
                         // normally captured at position N-2 in post_decode (alongside the target
                         // preamble).  This fallback captures at position N-1 for the case where
@@ -4060,7 +4111,18 @@ struct server_context_impl {
                                 memcpy(&v, &slot.draft_state_preamble[i], std::min((size_t) 4, sz - i));
                                 pre_hash ^= v;
                             }
-                            SLT_INF(slot, "preamble captured: sz=%zu hash=0x%08x\n", sz, pre_hash);
+                            SLT_INF(slot, "draft preamble captured at DONE_PROMPT: sz=%zu hash=0x%08x\n", sz, pre_hash);
+                        }
+
+                        // Capture pending_h for L3 save at position N-1 (single-batch case).
+                        // Only captures if not already set by post_decode preamble path.
+                        if (slot.spec_pending_h.empty()) {
+                            const size_t n_embd_pending = common_speculative_get_pending_h(slot.spec, slot.id, nullptr);
+                            if (n_embd_pending > 0) {
+                                slot.spec_pending_h.resize(n_embd_pending);
+                                common_speculative_get_pending_h(slot.spec, slot.id, slot.spec_pending_h.data());
+                                SLT_DBG(slot, "pending_h captured at DONE_PROMPT: %zu floats\n", n_embd_pending);
+                            }
                         }
 
                         GGML_ASSERT(batch.size() > 0);
@@ -4291,6 +4353,20 @@ struct server_context_impl {
                         dft_hash ^= v;
                     }
                     SLT_DBG(slot, "draft preamble captured at pos N-2: sz=%zu hash=0x%08x\n", sz_dft, dft_hash);
+
+                    // Capture pending_h at preamble position N-2 (the target's
+                    // h_nextn at the preamble cut).  This is the value used by
+                    // process() as position-0 draft embedding for the last prompt
+                    // token.  Saving h_nextn at end-of-generation (N-1) instead
+                    // causes restored runs to use the wrong draft embedding.
+                    if (slot.spec_pending_h.empty()) {
+                        const size_t n_embd_pending = common_speculative_get_pending_h(slot.spec, slot.id, nullptr);
+                        if (n_embd_pending > 0) {
+                            slot.spec_pending_h.resize(n_embd_pending);
+                            common_speculative_get_pending_h(slot.spec, slot.id, slot.spec_pending_h.data());
+                            SLT_DBG(slot, "pending_h captured at preamble N-2: %zu floats\n", n_embd_pending);
+                        }
+                    }
                 }
             }
         }

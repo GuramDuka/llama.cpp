@@ -395,8 +395,12 @@ class ServerProcess:
         if self.external_server:
             print("[external_server]: Not stopping external server")
             return
-        if self in server_instances:
-            server_instances.remove(self)
+        # Keep the object in server_instances so that the conftest
+        # stop_server_after_each_test fixture can correctly distinguish
+        # module-scoped servers from per-test temporary servers.
+        # (If we removed it here, a subsequent test's `before` snapshot
+        # might be empty, and the fixture would mistakenly stop the
+        # module-scoped server at the end of that test.)
         if self.process:
             print(f"Stopping server with pid={self.process.pid}")
             self.process.terminate()

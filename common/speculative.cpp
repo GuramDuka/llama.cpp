@@ -1049,8 +1049,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return 0;
         }
         const size_t n_embd_local = pending_h[seq_id].size();
-        if (n_embd_local == 0 || h == nullptr) {
+        if (n_embd_local == 0) {
             return 0;
+        }
+        if (h == nullptr) {
+            return n_embd_local;
         }
         std::memcpy(h, pending_h[seq_id].data(), n_embd_local * sizeof(float));
         return n_embd_local;
@@ -1077,6 +1080,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.n_tokens;
+        if (n_tokens < 2) {
+            auto *    mem_dft = llama_get_memory(this->params.ctx_dft);
+            llama_pos pos_max = llama_memory_seq_pos_max(mem_dft, 0);
+            size_t    dft_sz  = llama_state_seq_get_size_ext(this->params.ctx_dft, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+            fprintf(stderr, "DBG_PROCESS_1: n_tokens=%d pos_max=%d dft_sz=%zu batch_in.pos[0]=%d\n", n_tokens,
+                    (int) pos_max, dft_sz, n_tokens > 0 ? (int) batch_in.pos[0] : -1);
+            fflush(stderr);
+        }
 
         // remember the frist and last batch index for each sequence
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);

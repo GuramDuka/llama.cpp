@@ -105,6 +105,17 @@ def _send_completion(prompt: str, max_tokens: int = 8):
     )
 
 
+def _clear_cache_dir():
+    """Remove all KV cache files in the server's slot-save-path."""
+    if server and server.slot_save_path and os.path.exists(server.slot_save_path):
+        for fname in os.listdir(server.slot_save_path):
+            fpath = os.path.join(server.slot_save_path, fname)
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
+
+
 def _restart_server():
     """Stop current server and start a new one (reuse same cache dir)."""
     server.stop()
@@ -1135,7 +1146,6 @@ def test_mtp_completion(section_mtp):
     )
     assert res.status_code == 200
     assert len(res.body["content"]) > 0
-    server.stop()
 
 
 def test_mtp_draft_params(section_mtp):
@@ -1229,6 +1239,7 @@ def test_mtp_kv_cache_initialization(section_mtp):
 def test_mtp_first_request_save(section_mtp):
     """MTP: first request saves KV cache to disk."""
     global server
+    _restart_server()
     log = LogReader(server.log_path)
 
     res = _send_completion("What is 2+2? Briefly.", 8)
@@ -1420,8 +1431,7 @@ def test_mtp_l3_cache_deterministic(section_mtp):
 def test_mtp_l3_draft_preamble_saved(section_mtp):
     """The L3 save callback must write a .draft companion file."""
     global server
-    log = LogReader(server.log_path)
-
+    _restart_server()
     log = LogReader(server.log_path)
     res = _send_chat("Hello world", 16)
     assert res.status_code == 200
@@ -1519,6 +1529,7 @@ def test_mtp_l3_with_longer_prompt(section_mtp):
     global server
     server.n_predict = 16
     server.n_ctx = 1024
+    _clear_cache_dir()
     _restart_server()
     log = LogReader(server.log_path)
 

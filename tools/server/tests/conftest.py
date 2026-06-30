@@ -1,3 +1,4 @@
+import os
 import pytest
 from utils import *
 
@@ -10,9 +11,9 @@ def stop_server_after_each_test():
     yield
     # only stop servers that were started by this test
     # (servers started by module-scoped fixtures stay alive)
-    for server in list(server_instances):
-        if server not in before:
-            server.stop()
+    for srv in list(server_instances):
+        if srv not in before:
+            srv.stop()
 
 
 @pytest.fixture(scope="module", autouse=True)
