@@ -44,6 +44,31 @@ class ServerError(Exception):
         self.body = body
 
 
+def _ensure_port_free(port: int) -> None:
+    """Kill any process listening on *port* so the next server can bind."""
+    try:
+        # lsof -ti :PORT returns PIDs of processes listening on that port
+        result = subprocess.run(
+            ["lsof", "-ti", f":{port}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pids = result.stdout.strip().split()
+            for pid in pids:
+                try:
+                    pid_int = int(pid)
+                    os.kill(pid_int, 9)  # SIGKILL
+                    print(f"Killed stale process pid={pid_int} on port {port}")
+                except (ValueError, OSError):
+                    pass
+            # Brief wait for port to be fully released
+            time.sleep(0.2)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass  # lsof not available or error — proceed anyway
+
+
 class ServerProcess:
     # default options
     debug: bool = False
@@ -180,6 +205,8 @@ class ServerProcess:
             server_args.extend(["--models-max", self.models_max])
         if self.models_preset:
             server_args.extend(["--models-preset", self.models_preset])
+        _ensure_port_free(self.server_port)
+
         if self.n_batch:
             server_args.extend(["--batch-size", self.n_batch])
         if self.n_ubatch:
