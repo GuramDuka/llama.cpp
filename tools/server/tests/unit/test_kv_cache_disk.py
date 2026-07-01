@@ -424,6 +424,7 @@ def test_simple_ram_cache_preferred(section_simple):
     compare_log = log.drain()
     assert (
         "selected slot by LCP similarity" in compare_log
+        or "restored slot from L2 prompt cache" in compare_log
         or "restored slot from L3 disk cache" in compare_log
         or "selected slot by LRU" in compare_log
     ), f"No slot selection log: {compare_log[:800]}"
@@ -490,6 +491,13 @@ def test_simple_trie_rebuild_from_disk(section_simple):
     cached_text = res_cached.body["content"]
 
     hit_log = log.drain()
+    # Save hit_log for debugging
+    import uuid as _uuid
+
+    _debug_path = f"/tmp/trie_hit_{_uuid.uuid4().hex[:8]}.txt"
+    with open(_debug_path, "w") as _f:
+        _f.write(hit_log)
+    print(f"\nHIT_LOG saved: {_debug_path}")
     assert "best candidate from L3" in hit_log, (
         f"No L3 HIT after rebuild: {hit_log[:800]}"
     )

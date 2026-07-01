@@ -1433,12 +1433,6 @@ struct server_context_impl {
                 // draft state instead of the end-of-generation state.  This ensures
                 // that after L3 restore + seq_rm the draft cells have correct content.
                 std::vector<uint8_t> saved_draft_state;
-                fprintf(stderr,
-                        "DBG_PREAMBLE L3 save callback: ctx_dft=%p preamble_empty=%d preamble_sz=%zu "
-                        "task_tokens_orig_sz=%zu\n",
-                        (void *) slot.ctx_dft, (int) slot.draft_state_preamble.empty(),
-                        slot.draft_state_preamble.size(), slot.task_tokens_original.size());
-                fflush(stderr);
                 if (slot.ctx_dft && !slot.draft_state_preamble.empty()) {
                     // Snapshot the current (end-of-generation) draft state
                     const size_t cur_sz =
@@ -1472,20 +1466,11 @@ struct server_context_impl {
                         const size_t pre_sz =
                             llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
                         common_context_seq_rm(slot.ctx_dft, slot.id, -1, -1);
-                        const size_t post_sz =
-                            llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-                        fprintf(stderr, "DBG_PREAMBLE_RM: pre_sz=%zu post_sz=%zu id=%d\n", pre_sz, post_sz, slot.id);
                     }
 
                     // Replace ctx_dft with the pristine preamble state for saving
                     const size_t set_ret = llama_state_seq_set_data_ext(slot.ctx_dft, slot.draft_state_preamble.data(),
                                                                         slot.draft_state_preamble.size(), slot.id, 0);
-                    {
-                        const size_t after_sz =
-                            llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
-                        fprintf(stderr, "DBG_PREAMBLE_RESTORE: preamble_sz=%zu set_ret=%zu after_sz=%zu id=%d\n",
-                                slot.draft_state_preamble.size(), set_ret, after_sz, slot.id);
-                    }
                     if (set_ret == 0) {
                         SLT_WRN(slot, "L3 save: PREAMBLE RESTORE FAILED (returned 0)\n", 0);
                     }
@@ -2005,12 +1990,6 @@ struct server_context_impl {
                                                 std::vector<float> pending_h =
                                                     kv_cache_disk_mgr->load_pending_h(best.filepath);
                                                 if (!pending_h.empty()) {
-                                                    fprintf(stderr,
-                                                            "DBG_PENDING_H_AT_RESTORE: slot=%d sz=%zu "
-                                                            "first=%.8f last=%.8f\n",
-                                                            slot.id, pending_h.size(), (double) pending_h[0],
-                                                            (double) pending_h.back());
-                                                    fflush(stderr);
                                                     common_speculative_set_pending_h(
                                                         slot.spec, slot.id, pending_h.data(), pending_h.size());
                                                     slot.spec_pending_h = std::move(pending_h);
@@ -3421,15 +3400,6 @@ struct server_context_impl {
                         llama_state_seq_get_data_ext(slot.ctx_dft, dft_data.data(), dft_sz, slot.id,
                                                      LLAMA_STATE_SEQ_FLAGS_NONE);
                     }
-                    uint32_t dft_hash = 0;
-                    for (size_t i = 0; i < dft_sz; i += 4) {
-                        uint32_t v;
-                        memcpy(&v, &dft_data[i], std::min((size_t) 4, dft_sz - i));
-                        dft_hash ^= v;
-                    }
-                    fprintf(stderr, "DBG draft state BEFORE DRAFT: slot %d sz=%zu hash=0x%08x\n", slot.id, dft_sz,
-                            dft_hash);
-                    fflush(stderr);
                 }
             });
             common_speculative_draft(spec.get());
@@ -3990,17 +3960,6 @@ struct server_context_impl {
                             break;  // end of text chunk
                         }
 
-                        // After L3 restore, if n_past was decremented to force at least 1 token evaluation,
-                        // we need to ensure the first token is processed. This handles the case where
-                        // the prompt is fully cached but n_past was decremented.
-                        if (slot.n_prompt_tokens_cache == slot.task->n_tokens() - 1 && batch.size() == 0) {
-                            SLT_DBG(slot,
-                                    "forcing first token processing after L3 restore (n_past = %d, n_tokens = %d)\n",
-                                    slot.n_prompt_tokens_cache, slot.task->n_tokens());
-                            // Process the first token that was already in the KV cache
-                            cur_tok = input_tokens[0];
-                        }
-
                         // if this is an alora request with pre-invocation
                         // tokens that are not cached, we need to stop filling
                         // this batch at those pre-invocation tokens.
@@ -4446,15 +4405,6 @@ struct server_context_impl {
                         llama_state_seq_get_data_ext(slot.ctx_dft, dft_data.data(), dft_sz, slot.id,
                                                      LLAMA_STATE_SEQ_FLAGS_NONE);
                     }
-                    uint32_t dft_hash = 0;
-                    for (size_t i = 0; i < dft_sz; i += 4) {
-                        uint32_t v;
-                        memcpy(&v, &dft_data[i], std::min((size_t) 4, dft_sz - i));
-                        dft_hash ^= v;
-                    }
-                    fprintf(stderr, "DBG draft state at GENERATING: slot %d sz=%zu hash=0x%08x\n", slot.id, dft_sz,
-                            dft_hash);
-                    fflush(stderr);
                 }
 
             } else if (slot.state != SLOT_STATE_GENERATING) {
