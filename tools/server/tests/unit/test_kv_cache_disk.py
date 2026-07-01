@@ -466,6 +466,9 @@ def test_simple_combined_pool_lcp_match(section_simple):
 def test_simple_trie_rebuild_from_disk(section_simple):
     """Restart server: trie rebuild from disk, cache HIT for same request."""
     global server
+    # Start fresh to avoid interference from previous tests in the
+    # module-scoped fixture (which leaks L2 cache entries and n_slots).
+    _restart_server()
     log = LogReader(server.log_path)
     res_fresh = _send_completion("What is 2+2? Briefly.", 8)
     assert res_fresh.status_code == 200
